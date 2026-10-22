@@ -1,83 +1,83 @@
-# Lucario Morph Sync — сервер синхронизации образов
+# Lucario Morph Sync — the morph sync server
 
-Крошечный HTTP-сервис для игры с модом
-[Lucario Morph](https://github.com/Insoulum/lucario-morph) на серверах,
-**где сам мод не установлен**. Клиенты мода пишут сюда «мой UUID → мой образ»
-и читают образы других игроков. Данные косметические: UUID, вариант и время
-обновления. Ничего личного сервис не хранит.
+A tiny HTTP service for playing
+[Lucario Morph](https://github.com/Insoulum/lucario-morph) on servers where
+**the mod itself is not installed**. Clients of the mod write "my UUID → my morph"
+here and read the morphs of other players. The data is cosmetic: UUID, variant and
+update time. The service stores nothing personal.
 
-Сервис — один файл `service.py` на чистой стандартной библиотеке Python
-(без зависимостей), упакован в Docker. Потребляет копейки RAM/CPU.
+The service is a single `service.py` file on the pure Python standard library
+(no dependencies), packaged in Docker. It consumes pennies of RAM/CPU.
 
-## Быстрый запуск на VDS
+## Quick start on a VPS
 
 ```bash
-# 1. Скопируйте репозиторий на сервер, например:
+# 1. Copy the repository to the server, e.g.:
 git clone https://github.com/Insoulum/lucariomorph-server.git /opt/lucario-sync
-# (или scp -r этой папки, если git не нужен)
+# (or scp -r this folder if you don't need git)
 
-# 2. На сервере:
+# 2. On the server:
 cd /opt/lucario-sync
 docker compose up -d --build
 
-# 3. Проверка:
+# 3. Check:
 curl http://127.0.0.1:8080/health
 # -> {"ok": true, "players": 0}
 
-# 4. Откройте порт снаружи (если включён файрвол):
+# 4. Open the port externally (if a firewall is enabled):
 ufw allow 8080/tcp        # Debian/Ubuntu
 # firewall-cmd --add-port=8080/tcp --permanent && firewall-cmd --reload   # RHEL/CentOS
 ```
 
-Проверка снаружи с вашего ПК:
+Checking from outside, from your PC:
 
 ```bash
 curl http://193.164.155.75:8080/health
 ```
 
-После этого клиенты мода (версии 1.4.0+) увидят сервис автоматически —
-добавьте адрес в `serviceUrls` конфига мода (`config/lucariomorph.json`).
+After that, mod clients (1.4.0+) will see the service — add the address to the
+`serviceUrls` of the mod config (`config/lucariomorph.json`).
 
 ## API
 
-| Метод | Путь | Назначение |
+| Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | проверка живости + число записей |
-| GET | `/v1/morphs?uuids=A,B,C` | образы перечисленных игроков (макс. 100 за раз) |
-| PUT | `/v1/morphs/<uuid>` | задать образ, тело `{"variant": "lucariocaptain_shiny"}`; `""` — снять. Для защищённого UUID нужен заголовок `X-Lucario-Token` |
-| DELETE | `/v1/morphs/<uuid>` | снять образ (тоже с токеном, если UUID защищён) |
-| POST | `/v1/auth/challenge` | шаг 1 авторизации: `{"uuid","name"}` → `{"serverId"}` |
-| POST | `/v1/auth/verify` | шаг 3 авторизации: `{"uuid","name","serverId"}` → `{"token"}` (после проверки у Mojang) |
+| GET | `/health` | liveness check + number of records |
+| GET | `/v1/morphs?uuids=A,B,C` | morphs of the listed players (max 100 at a time) |
+| PUT | `/v1/morphs/<uuid>` | set the morph, body `{"variant": "lucariocaptain_shiny"}`; `""` — clear. A protected UUID requires the `X-Lucario-Token` header |
+| DELETE | `/v1/morphs/<uuid>` | clear the morph (also tokened if the UUID is protected) |
+| POST | `/v1/auth/challenge` | authorization step 1: `{"uuid","name"}` → `{"serverId"}` |
+| POST | `/v1/auth/verify` | authorization step 3: `{"uuid","name","serverId"}` → `{"token"}` (after checking with Mojang) |
 
-Примеры:
+Examples:
 
 ```bash
-# поставить образ
+# set a morph
 curl -X PUT http://127.0.0.1:8080/v1/morphs/069a79f4-44e9-4726-a5be-fca90e38aaf5 \
      -H 'Content-Type: application/json' -d '{"variant": "lucariocaptain_shiny"}'
 
-# узнать
+# query
 curl 'http://127.0.0.1:8080/v1/morphs?uuids=069a79f4-44e9-4726-a5be-fca90e38aaf5'
 
-# снять
+# clear
 curl -X DELETE http://127.0.0.1:8080/v1/morphs/069a79f4-44e9-4726-a5be-fca90e38aaf5
 ```
 
-Принимаются только варианты из белого списка мода (16 базовых + `_shiny`-версии),
-иначе — `422`. Мусор/перегруз отсекаются: лимит 120 запросов в минуту с IP (`429`),
-тело ≤ 4 КБ, только валидные UUID, потолок хранилища `MAX_RECORDS` (`507`).
+Only variants from the mod's whitelist are accepted (16 base ones + `_shiny` versions),
+otherwise — `422`. Junk/overload is cut off: a limit of 120 requests per minute per IP
+(`429`), body ≤ 4 KB, valid UUIDs only, a `MAX_RECORDS` storage ceiling (`507`).
 
-## Авторизация записи (Mojang session servers, с версии 1.4.0)
+## Record authorization (Mojang session servers, since 1.4.0)
 
-Любой, знающий чужой UUID, может писать в открытое хранилище (максимум вреда — чужой
-косметический образ). Чтобы дать игроку защиту, клиент мода доказывает владение
-аккаунтом тем же способом, каким ванильный сервер проверяет игроков:
+Anyone who knows someone else's UUID could write to an open store (the maximum harm —
+someone else's cosmetic morph). To give players protection, the mod client proves
+account ownership the same way a vanilla server verifies players:
 
 ```
-клиент                          этот сервис                        Mojang
+client                          this service                       Mojang
   │ POST /v1/auth/challenge        │                                 │
-  │───────────────────────────────>│ генерит serverId (одноразовый,  │
-  │<──────── {"serverId": …} ──────│ живёт 5 мин, привязан к IP+UUID)│
+  │───────────────────────────────>│ generates a serverId (one-shot, │
+  │<──────── {"serverId": …} ──────│ lives 5 min, bound to IP+UUID)  │
   │ POST sessionserver.mojang.com/session/minecraft/join             │
   │──────────────────────────────────────────────────────────────────>│
   │            {accessToken, selectedProfile, serverId}  (HTTPS!)    │
@@ -86,101 +86,101 @@ curl -X DELETE http://127.0.0.1:8080/v1/morphs/069a79f4-44e9-4726-a5be-fca90e38a
   │───────────────────────────────>│ GET hasJoined?username&serverId│
   │                                │───────────────────────────────>│
   │                                │<────── {"id","name"} / 204 ────│
-  │<───────── {"token": …} ─────────│ id совпал → выдать/вернуть токен│
+  │<───────── {"token": …} ─────────│ id matched → issue/return token│
 ```
 
-Дальше PUT/DELETE для этого UUID требуют заголовок `X-Lucario-Token: <token>`
-(иначе `401`). Ключевые свойства:
+From then on, PUT/DELETE for that UUID require the `X-Lucario-Token: <token>` header
+(otherwise `401`). Key properties:
 
-* **защита opt-in**: UUID без токена пишется свободно, как раньше;
-* **токен восстановим**: verify возвращает уже выданный токен — после удаления
-  конфига клиент повторяет авторизацию и получает тот же (осиротевших записей нет);
-* **accessToken не видит сервис**: он уходит только напрямую в Mojang по HTTPS;
-* подделать verify нельзя: hasJoined возвращает профиль того, кто реально сделал
-  join с этим serverId; challenge одноразовый и привязан к IP+UUID+нику;
-* работает только с лицензионными клиентами (у офлайн-сессий join Mojang отклонит);
-* вызов Mojang имеет таймаут 8 с и выполняется **вне блокировок** — медленный/лежащий
-  session-сервер не залипает сам сервис (проверено нагрузочным тестом).
+* **opt-in protection**: a UUID without a token is written freely, as before;
+* **the token is recoverable**: verify returns the already issued token — after deleting
+  the config, the client repeats the authorization and gets the same one (no orphaned records);
+* **the service never sees the accessToken**: it is sent only directly to Mojang over HTTPS;
+* verify cannot be spoofed: hasJoined returns the profile of whoever actually performed
+  the join with that serverId; the challenge is one-shot and bound to IP+UUID+name;
+* works with licensed clients only (for offline sessions Mojang rejects the join);
+* the Mojang call has an 8 s timeout and runs **outside all locks** — a slow/down session
+  server cannot wedge the service itself (verified with a load test).
 
-Токены хранятся в `./data/tokens.json` (uuid → токен, ник, время выдачи) и
-**не протухают** — бэкапьте вместе с `morphs.json`. Если файл потерять, защита
-слетит (записи снова открытые), а игроки восстановят её автоматически при первой
-авторизации.
+Tokens are stored in `./data/tokens.json` (uuid → token, name, issue time) and **do not
+expire** — back them up together with `morphs.json`. If the file is lost, protection
+falls off (records become open again) and players will restore it automatically at their
+next authorization.
 
-Ручной прогон цепочки curl-ом (как это видит сервис):
+Manually running the chain with curl (as the service sees it):
 
 ```bash
-# шаг 1: challenge
+# step 1: challenge
 SID=$(curl -s -X POST http://127.0.0.1:8080/v1/auth/challenge \
      -H 'Content-Type: application/json' \
      -d '{"uuid":"069a79f4-44e9-4726-a5be-fca90e38aaf5","name":"Notch"}' | jq -r .serverId)
-# шаг 2 выполняет КЛИЕНТ МОДА на стороне игрока (join на sessionserver.mojang.com)
-# шаг 3: verify (вернёт 403, если join не был сделан обладателем аккаунта)
+# step 2 is performed by THE MOD CLIENT on the player's side (join on sessionserver.mojang.com)
+# step 3: verify (returns 403 if the join was not made by the account owner)
 curl -s -X POST http://127.0.0.1:8080/v1/auth/verify \
      -H 'Content-Type: application/json' \
      -d "{\"uuid\":\"069a79f4-44e9-4726-a5be-fca90e38aaf5\",\"name\":\"Notch\",\"serverId\":\"$SID\"}"
 ```
 
-## Тесты
+## Tests
 
-Интеграционный набор поднимает сервис локально (без Docker), а рядом — заглушку
-session-серверов Mojang (`tests/mojang_stub.py`), и прогоняет полный цикл:
-валидацию API, канонизацию UUID, снятие образов, авторизацию
-(challenge → join → verify), защиту токеном, повторную выдачу токена,
-rate-limit и переполнение хранилища.
+The integration suite starts the service locally (without Docker) plus a stub of the
+Mojang session servers (`tests/mojang_stub.py`), and runs the full cycle: API validation,
+UUID canonicalization, clearing morphs, authorization (challenge → join → verify),
+token protection, token re-issue, rate limiting and storage overflow.
 
 ```bash
 bash tests/test_auth_flow.sh
-# ИТОГО: PASS=23 FAIL=0
+# TOTAL: PASS=25 FAIL=0
 ```
 
-Тот же набор автоматически выполняется в GitHub Actions при каждом push.
+The same suite runs automatically in GitHub Actions on every push.
 
-## Настройки
+## Settings
 
-Задаются окружением в `docker-compose.yml`:
+Set via the environment in `docker-compose.yml`:
 
-| Переменная | По умолчанию | Смысл |
+| Variable | Default | Meaning |
 |---|---|---|
-| `PORT` | `8080` | порт внутри контейнера |
-| `RATE_PER_MIN` | `120` | запросов в минуту с одного IP |
-| `TTL_HOURS` | `0` | через сколько часов неактуальная запись удаляется; `0` — использовать `TTL_DAYS` |
-| `TTL_DAYS` | `30` | то же в днях, используется при `TTL_HOURS=0` |
-| `HOUSEKEEPING_SECONDS` | `3600` | как часто чистить протухшие записи и challenge (минимум 1) |
-| `MAX_RECORDS` | `100000` | потолок хранилища; при переполнении PUT отвечает `507` |
-| `FLUSH_SECONDS` | `5` | как часто изменения сбрасываются на диск (пакетная запись) |
-| `MOJANG_SESSION` | `https://sessionserver.mojang.com` | адрес session-сервера Mojang (в тестах подменяется заглушкой) |
-| `CHALLENGE_TTL` | `300` | время жизни одноразового challenge, секунд |
-| `MAX_PENDING` | `10000` | максимум незавершённых challenge (защита памяти) |
+| `PORT` | `8080` | port inside the container |
+| `RATE_PER_MIN` | `120` | requests per minute from one IP |
+| `TTL_HOURS` | `0` | after how many hours a stale record is removed; `0` — use `TTL_DAYS` |
+| `TTL_DAYS` | `30` | the same in days, used when `TTL_HOURS=0` |
+| `HOUSEKEEPING_SECONDS` | `3600` | how often expired records and challenges are cleaned up (minimum 1) |
+| `MAX_RECORDS` | `100000` | storage ceiling; PUT answers `507` when full |
+| `FLUSH_SECONDS` | `5` | how often changes are flushed to disk (batched writes) |
+| `MOJANG_SESSION` | `https://sessionserver.mojang.com` | address of the Mojang session server (replaced by a stub in tests) |
+| `CHALLENGE_TTL` | `300` | lifetime of a one-shot challenge, seconds |
+| `MAX_PENDING` | `10000` | maximum unfinished challenges (memory protection) |
 
-### Про TTL и «пульс» клиента
+### About TTL and the client "pulse"
 
-Запись образа живёт ограниченное время: клиент мода (1.4.2+) обновляет свою запись
-сам — при входе в мир, при смене образа и тихим «пульсом» раз в `heartbeatMinutes`
-минут (по умолчанию 15, настраивается в конфиге клиента). Поэтому короткий TTL
-безопасен: у активных игроков запись всегда свежая, а брошенные (мод удалён,
-игрок исчез) удаляются сами за `TTL + HOUSEKEEPING_SECONDS`.
+A morph record lives for a limited time: the mod client (1.4.2+) refreshes its record
+by itself — on world join, on morph change, and with a silent "pulse" every
+`heartbeatMinutes` minutes (default 15, configured in the client config). A short TTL
+is therefore safe: active players always have a fresh record, while abandoned ones
+(mod uninstalled, player gone) are removed automatically within
+`TTL + HOUSEKEEPING_SECONDS`.
 
-Рекомендуемая связка — `TTL_HOURS=6` + `HOUSEKEEPING_SECONDS=600` (стоит в
-`docker-compose.yml`): «призрак» удалённого мода исчезает за 6–7 часов вместо
-30 дней. Для очень коротких TTL (меньше часа) уменьшайте и housekeeping,
-чтобы чистка не отставала от протухания. Клиенты мода 1.4.1 и старше тоже
-безопасны: они перепубликуют образ каждые ~30 секунд, пока находятся в мире.
+The recommended pairing is `TTL_HOURS=6` + `HOUSEKEEPING_SECONDS=600` (set in
+`docker-compose.yml`): the "ghost" of an uninstalled mod disappears in 6–7 hours instead
+of 30 days. For very short TTLs (under an hour), reduce the housekeeping interval too,
+so cleanup doesn't lag behind expiration. Mod clients 1.4.1 and older are safe as well:
+they re-publish their morph every ~30 seconds while in the world.
 
-Данные пишутся на диск батчами (раз в `FLUSH_SECONDS` при изменениях) и при остановке
-контейнера (`SIGTERM` обрабатывается — `docker stop` ничего не теряет). «Медленные»
-соединения закрываются через 30 секунд — slowloris-исчерпание потоков не проходит.
-UUID приводятся к каноническому виду, так что `urn:uuid:...` и `{...}`-формы
-складываются в ту же запись, что и обычная форма.
+Data is written to disk in batches (every `FLUSH_SECONDS` when there are changes) and on
+container shutdown (`SIGTERM` is handled — `docker stop` loses nothing). "Slow"
+connections are closed after 30 seconds — slowloris thread exhaustion doesn't get
+through. UUIDs are canonicalized, so `urn:uuid:...` and `{...}` forms land in the same
+record as the plain form.
 
-Хранилище — `./data/morphs.json` (образы) и `./data/tokens.json` (токены записи)
-на хосте: переживают перезапуск контейнера, их удобно бэкапить. Если порт 8080
-на сервере занят — поменяйте **левую** часть маппинга (`"9090:8080"`) и укажите
-новый адрес зеркалом в конфиге мода.
+The storage is `./data/morphs.json` (morphs) and `./data/tokens.json` (write tokens) on
+the host: they survive container restarts and are easy to back up. If port 8080 on the
+server is busy — change the **left** side of the mapping (`"9090:8080"`) and add the new
+address as a mirror in the mod config.
 
-## Зеркала в конфиге мода
+## Mirrors in the mod config
 
-Клиент читает `config/lucariomorph.json`:
+The client reads `config/lucariomorph.json`:
 
 ```json
 {
@@ -190,37 +190,38 @@ UUID приводятся к каноническому виду, так что 
   "syncIntervalSeconds": 5,
   "serviceUrls": [
     "http://193.164.155.75:8080",
-    "http://мой-зеркало.example.org:8080"
+    "http://my-mirror.example.org:8080"
   ],
   "lastVariant": "lucariocaptain_shiny"
 }
 ```
 
-* публикация своего образа идёт во **все** зеркала списка;
-* чтение — с первого ответившего (приоритет у успешного в прошлый раз);
-* чтобы игроки видели друг друга, их списки зеркал должны иметь общее зеркало —
-  проще всего держать списки одинаковыми;
-* своё зеркало поднимается так же: этот репозиторий на любой машине
-  с Docker, IP/домен добавляется в `serviceUrls`.
+* publishing your own morph goes to **all** mirrors of the list;
+* reading — from the first one that responds (the previously successful one has priority);
+* for players to see each other, their mirror lists must share a common mirror —
+  the simplest is to keep the lists identical;
+* your own mirror is set up the same way: this repository on any machine with Docker,
+  and the IP/domain is added to `serviceUrls`.
 
-## HTTPS (рекомендуется с 1.4.0)
+## HTTPS (recommended since 1.4.0)
 
-Обычные данные синка косметические и для них хватало открытого HTTP. Но с версии
-1.4.0 по проводу ходит и **токен записи** — перехватив его, можно писать за чужой
-защищённый UUID. Для серьёзной защиты поставьте перед контейнером nginx/caddy
-с сертификатом (например, поддомен `sync.insoulum.ru` — Caddy сам получит
-Let's Encrypt) и добавьте `https://sync.insoulum.ru` в `serviceUrls` клиентов —
-контейнер трогать не нужно (токены для HTTPS-адреса — отдельные: игрокам нужно
-будет один раз авторизоваться и для него — мод сделает это сам при первом 401).
+Ordinary sync data is cosmetic and plain HTTP used to be enough for it. But since 1.4.0
+the **write token** also travels over the wire — intercepting it lets anyone write for a
+protected foreign UUID. For serious protection, put nginx/caddy with a certificate in
+front of the container (e.g. a `sync.insoulum.ru` subdomain — Caddy obtains a Let's
+Encrypt certificate by itself) and add `https://sync.insoulum.ru` to the clients'
+`serviceUrls` — the container doesn't need changes (tokens for the HTTPS address are
+separate: players will need to authorize once for it as well — the mod does it by
+itself on the first 401).
 
-## Приватность
+## Privacy
 
-* Хранится: UUID игрока, вариант образа, время последнего обновления; для авторизованных —
-  токен записи и ник. Всё.
-* IP встречаются только в логах контейнера (для rate-limit) и в памяти challenge —
-  в файлы данных не пишутся.
-* `accessToken` игрока сервис **не получает никогда**: join уходит клиентом напрямую
-  в Mojang по HTTPS.
-* Без авторизации любой игрок может «нарисовать» чужому UUID любой валидный вариант —
-  максимум вреда: другой косметический образ. Лекарство — авто-авторизация на стороне
-  игрока (см. раздел «Авторизация записи»).
+* Stored: player UUID, morph variant, last update time; for authorized players — the
+  write token and name. That's all.
+* IPs appear only in container logs (for rate limiting) and in challenge memory —
+  they are never written to the data files.
+* The player's `accessToken` is **never received by the service**: the join is sent by
+  the client directly to Mojang over HTTPS.
+* Without authorization, any player can "draw" any valid variant onto a foreign UUID —
+  maximum harm: a different cosmetic morph. The cure is client-side auto-authorization
+  (see "Record authorization").

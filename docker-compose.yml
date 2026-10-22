@@ -5,20 +5,20 @@ services:
     container_name: lucario-sync
     restart: unless-stopped
     ports:
-      - "8080:8080"          # хост:контейнер — поменяйте левую часть, если 8080 занят
+      - "8080:8080"          # host:container — change the left side if 8080 is taken
     environment:
       PORT: "8080"
-      RATE_PER_MIN: "120"    # запросов в минуту с одного IP
-      TTL_HOURS: "6"         # запись живёт 6 часов без обновлений; клиенты 1.4.2+ сами
-                             # обновляют её раз в heartbeatMinutes минут (по умолчанию 15),
-                             # так что у активных игроков запись не протухает, а брошенные
-                             # (мод удалён) исчезают сами за 6–7 часов.
-                             # Поставьте "0", чтобы вернуться к TTL_DAYS.
-      TTL_DAYS: "30"         # используется только при TTL_HOURS="0"
-      HOUSEKEEPING_SECONDS: "600"  # как часто чистить протухшие записи (минимум 1)
-      # --- авторизация записи через Mojang (можно не трогать) ---
-      # MOJANG_SESSION: "https://sessionserver.mojang.com"  # для тестов можно подменить заглушкой
-      # CHALLENGE_TTL: "300"     # время жизни одноразового challenge, сек
-      # MAX_PENDING: "10000"     # максимум незавершённых challenge
+      RATE_PER_MIN: "120"    # requests per minute from one IP
+      TTL_HOURS: "6"         # a record lives 6 hours without updates; clients 1.4.2+
+                             # refresh it every heartbeatMinutes minutes (default 15),
+                             # so active players' records never expire, while abandoned
+                             # ones (mod uninstalled) disappear on their own within 6-7 hours.
+                             # Set to "0" to fall back to TTL_DAYS.
+      TTL_DAYS: "30"         # used only when TTL_HOURS="0"
+      HOUSEKEEPING_SECONDS: "600"  # how often expired records are cleaned up (minimum 1)
+      # --- record authorization via Mojang (safe to leave untouched) ---
+      # MOJANG_SESSION: "https://sessionserver.mojang.com"  # can be replaced with a stub for tests
+      # CHALLENGE_TTL: "300"     # lifetime of a one-shot challenge, sec
+      # MAX_PENDING: "10000"     # maximum unfinished challenges
     volumes:
-      - ./data:/data         # morphs.json (образы) + tokens.json (токены) — не теряются при пересборке
+      - ./data:/data         # morphs.json (morphs) + tokens.json (tokens) — survive rebuilds

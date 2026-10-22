@@ -1,41 +1,42 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Lucario Morph Sync — лёгкий сервис синхронизации образов.
+Lucario Morph Sync — a lightweight morph synchronization service.
 
-Мод Lucario Morph (Fabric, клиентский по духу) на серверах БЕЗ мода не может
-передавать образы игроков через сам сервер Minecraft. Этот сервис — общее
-хранилище «UUID игрока → вариант образа», куда клиенты пишут свой образ и откуда
-читают образы других.
+The Lucario Morph mod (Fabric, client-side at heart) cannot pass player morphs
+through the Minecraft server itself on servers WITHOUT the mod. This service is a
+shared "player UUID → morph variant" store where clients publish their own morph
+and read the morphs of others.
 
-Протокол (v1):
+Protocol (v1):
   GET    /health                 -> {"ok": true, "players": N}
-  GET    /v1/morphs?uuids=A,B,C  -> {"<uuid>": "<variant>", ...}   (только известные)
-  PUT    /v1/morphs/<uuid>       тело {"variant": "lucariocaptain_shiny"} или {"variant": ""} (снять)
-  DELETE /v1/morphs/<uuid>       -> снять образ
-  POST   /v1/auth/challenge      {"uuid","name"} -> {"serverId"}          (авторизация записи, шаг 1)
-  POST   /v1/auth/verify         {"uuid","name","serverId"} -> {"token"}  (шаг 3, проверено через Mojang)
+  GET    /v1/morphs?uuids=A,B,C  -> {"<uuid>": "<variant>", ...}   (known ones only)
+  PUT    /v1/morphs/<uuid>       body {"variant": "lucariocaptain_shiny"} or {"variant": ""} (clear)
+  DELETE /v1/morphs/<uuid>       -> clear the morph
+  POST   /v1/auth/challenge      {"uuid","name"} -> {"serverId"}          (record authorization, step 1)
+  POST   /v1/auth/verify         {"uuid","name","serverId"} -> {"token"}  (step 3, verified via Mojang)
 
-Правила безопасности:
-  * принимаются только UUID (приводятся к каноническому виду) и только варианты
-    из белого списка мода;
-  * ограничение частоты запросов с одного IP (RATE_PER_MIN);
-  * тело запроса не больше 4 КБ, максимум 100 UUID за один GET;
-  * «медленные» соединения закрываются через 30 секунд бездействия (slowloris);
-  * UUID можно защитить токеном записи: клиент доказывает владение аккаунтом через
-    session-серверы Mojang (challenge -> join -> verify), после чего PUT/DELETE для
-    этого UUID требуют заголовок X-Lucario-Token. Защита opt-in: UUID без токена
-    пишется свободно (максимум вреда — чужой косметический образ);
-  * challenge одноразовый, живёт CHALLENGE_TTL секунд и привязан к IP, UUID и нику;
-  * обращение к Mojang — СНАРУЖИ всех блокировок и с жёстким таймаутом (устойчивость);
-  * не больше MAX_RECORDS записей (при переполнении — 507);
-  * записи старше TTL удаляются (TTL_HOURS, при нуле — TTL_DAYS): клиенты с модом
-    1.4.2+ сами обновляют свою запись раз в heartbeatMinutes минут и при каждом
-    входе в мир, поэтому запись без обновлений — брошенная (мод удалён).
+Safety rules:
+  * only UUIDs are accepted (canonicalized) and only variants from the mod's
+    whitelist;
+  * per-IP request rate limit (RATE_PER_MIN);
+  * request body no larger than 4 KB, at most 100 UUIDs per GET;
+  * "slow" connections are closed after 30 seconds of inactivity (slowloris);
+  * a UUID can be protected with a write token: the client proves account ownership
+    via the Mojang session servers (challenge -> join -> verify), after which PUT/DELETE
+    for that UUID require the X-Lucario-Token header. Opt-in protection: a UUID without
+    a token is written freely (maximum harm — someone else's cosmetic morph);
+  * the challenge is one-shot, lives CHALLENGE_TTL seconds and is bound to IP, UUID and name;
+  * the Mojang call happens OUTSIDE all locks and with a hard timeout (resilience);
+  * no more than MAX_RECORDS records (507 when full);
+  * records older than TTL are removed (TTL_HOURS, or TTL_DAYS when zero): mod clients
+    1.4.2+ refresh their own record every heartbeatMinutes minutes and on every world
+    join, so a record without updates is abandoned (the mod was uninstalled).
 
-Хранилище — JSON-файлы (DATA_DIR/morphs.json и DATA_DIR/tokens.json). Запись на диск
-пакетная (раз в 5 секунд при изменениях) и при остановке контейнера (SIGTERM/SIGINT).
-Зависимостей нет: только стандартная библиотека Python 3.10+.
+Storage — JSON files (DATA_DIR/morphs.json and DATA_DIR/tokens.json). Disk writes are
+batched (every 5 seconds when there are changes) and happen on container shutdown
+(SIGTERM/SIGINT).
+No dependencies: Python 3.10+ standard library only.
 """
 import hashlib
 import json
@@ -53,7 +54,7 @@ from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urlsplit
 from urllib.request import Request, urlopen
 
-# --- Белый список вариантов (должен совпадать с Variants.java мода) ---
+# --- Variant whitelist (must match the mod's Variants.java) ---
 BASES = [
     "lucario", "lucariocafe", "lucariocaptain", "lucariochef", "lucarioconcert",
     "lucariocostumeparty", "lucarioholiday", "lucariomartialarts", "lucariomega",
@@ -62,15 +63,15 @@ BASES = [
 ]
 ALLOWED = set(BASES) | {b + "_shiny" for b in BASES}
 
-# --- Настройки (окружением) ---
+# --- Settings (via environment) ---
 PORT = int(os.environ.get("PORT", "8080"))
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DATA_FILE = os.path.join(DATA_DIR, "morphs.json")
 RATE_PER_MIN = int(os.environ.get("RATE_PER_MIN", "120"))
 TTL_DAYS = float(os.environ.get("TTL_DAYS", "30"))
-# TTL_HOURS (если > 0) перекрывает TTL_DAYS — удобно для коротких TTL (1..6 часов):
-# клиент с heartbeat обновляет запись каждые несколько минут, так что короткий TTL
-# безопасен, а брошенные записи (мод удалён) исчезают сами за TTL + HOUSEKEEPING.
+# TTL_HOURS (> 0) overrides TTL_DAYS — handy for short TTLs (1..6 hours):
+# a heartbeat client refreshes its record every few minutes, so a short TTL is
+# safe, while abandoned records (mod uninstalled) expire on their own within TTL + HOUSEKEEPING.
 TTL_HOURS = float(os.environ.get("TTL_HOURS", "0"))
 TTL_SECONDS = int(TTL_HOURS * 3600) if TTL_HOURS > 0 else int(TTL_DAYS * 86400)
 HOUSEKEEPING_SECONDS = max(1.0, float(os.environ.get("HOUSEKEEPING_SECONDS", "3600")))
@@ -79,7 +80,7 @@ FLUSH_SECONDS = float(os.environ.get("FLUSH_SECONDS", "5"))
 MAX_BODY = 4096
 MAX_UUIDS = 100
 
-# --- Авторизация записи (Mojang session servers) ---
+# --- Record authorization (Mojang session servers) ---
 MOJANG_SESSION = os.environ.get("MOJANG_SESSION", "https://sessionserver.mojang.com").rstrip("/")
 CHALLENGE_TTL = float(os.environ.get("CHALLENGE_TTL", "300"))
 MAX_PENDING = int(os.environ.get("MAX_PENDING", "10000"))
@@ -87,13 +88,13 @@ TOK_FILE = os.path.join(DATA_DIR, "tokens.json")
 NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
 SERVER_ID_RE = re.compile(r"^[0-9a-f]{40}$")
 
-STORE = {}                     # uuid (канонический) -> {"variant": str, "ts": float}
-TOKENS = {}                    # uuid (канонический) -> {"token", "name", "ts"}  (токены записи)
-PENDING = {}                   # serverId -> {"uuid", "name", "ip", "ts"}  (живые challenge)
-DIRTY = False                  # есть несохранённые изменения morphs.json (под LOCK)
-TOK_DIRTY = False              # есть несохранённые изменения tokens.json (под LOCK)
-LOCK = threading.Lock()        # STORE/TOKENS/DIRTY/TOK_DIRTY; листовый лок: под ним нет ни сетевого I/O, ни других локов
-PENDING_LOCK = threading.Lock()  # PENDING; тоже листовый
+STORE = {}                     # uuid (canonical) -> {"variant": str, "ts": float}
+TOKENS = {}                    # uuid (canonical) -> {"token", "name", "ts"}  (write tokens)
+PENDING = {}                   # serverId -> {"uuid", "name", "ip", "ts"}  (live challenges)
+DIRTY = False                  # unsaved morphs.json changes exist (under LOCK)
+TOK_DIRTY = False              # unsaved tokens.json changes exist (under LOCK)
+LOCK = threading.Lock()        # STORE/TOKENS/DIRTY/TOK_DIRTY; leaf lock: no network I/O or other locks under it
+PENDING_LOCK = threading.Lock()  # PENDING; a leaf lock too
 RATE = defaultdict(deque)
 RATE_LOCK = threading.Lock()
 
@@ -112,14 +113,14 @@ def load() -> None:
                 canonical = str(uuidlib.UUID(k))
             except ValueError:
                 continue
-            STORE[canonical] = {"variant": v, "ts": now}  # ts неизвестен — считаем свежей
+            STORE[canonical] = {"variant": v, "ts": now}  # ts unknown — treat as fresh
         print(f"loaded {len(STORE)} records from {DATA_FILE}", flush=True)
-    except Exception as e:  # noqa: BLE001 — сервис не должен падать из-за кривого файла
+    except Exception as e:  # noqa: BLE001 — the service must not crash on a malformed file
         print(f"cannot load {DATA_FILE}: {e!r}", flush=True)
 
 
 def save_locked() -> None:
-    """Атомарная запись всего хранилища. Вызывать только под LOCK."""
+    """Atomically write the whole store. Call only while holding LOCK."""
     os.makedirs(DATA_DIR, exist_ok=True)
     tmp = DATA_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -128,7 +129,7 @@ def save_locked() -> None:
 
 
 def save_tokens_locked() -> None:
-    """Атомарная запись токенов. Вызывать только под LOCK."""
+    """Atomically write the tokens. Call only while holding LOCK."""
     os.makedirs(DATA_DIR, exist_ok=True)
     tmp = TOK_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -137,11 +138,11 @@ def save_tokens_locked() -> None:
 
 
 def set_token(uuid_str: str, name: str) -> str:
-    """Создаёт или возвращает существующий токен записи UUID.
+    """Creates or returns the existing write token of a UUID.
 
-    Уже выданный токен возвращается как есть — так клиент восстанавливает
-    доступ после удаления конфига: личность заново доказана через Mojang,
-    и сервис отдаёт тот же токен.
+    An already issued token is returned as is — this is how the client regains
+    access after deleting its config: identity is re-proven via Mojang,
+    and the service hands out the same token.
     """
     global TOK_DIRTY
     with LOCK:
@@ -155,7 +156,7 @@ def set_token(uuid_str: str, name: str) -> str:
 
 
 def flush_now() -> None:
-    """Сбрасывает изменения на диск, если они есть."""
+    """Flushes pending changes to disk, if any."""
     global DIRTY, TOK_DIRTY
     with LOCK:
         m_dirty, DIRTY = DIRTY, False
@@ -167,7 +168,7 @@ def flush_now() -> None:
 
 
 def set_morph(uuid_str: str, variant: str) -> bool:
-    """Обновляет запись. Возвращает False, если хранилище переполнено."""
+    """Upserts a record. Returns False when the store is full."""
     global DIRTY
     with LOCK:
         if variant:
@@ -181,14 +182,14 @@ def set_morph(uuid_str: str, variant: str) -> bool:
 
 
 def flusher() -> None:
-    """Пакетный сброс изменений на диск: не чаще раза в FLUSH_SECONDS."""
+    """Batched disk flush: at most once per FLUSH_SECONDS."""
     while True:
         time.sleep(FLUSH_SECONDS)
         flush_now()
 
 
 def housekeeping() -> None:
-    """Раз в HOUSEKEEPING_SECONDS выкидывает протухшие записи и подчищает счётчики rate-limit."""
+    """Every HOUSEKEEPING_SECONDS, drops expired records and trims rate-limit counters."""
     while True:
         time.sleep(HOUSEKEEPING_SECONDS)
         global DIRTY
@@ -204,7 +205,7 @@ def housekeeping() -> None:
             for k in stale:
                 del STORE[k]
             if stale:
-                DIRTY = True  # сохранит flusher
+                DIRTY = True  # the flusher will persist it
         with RATE_LOCK:
             now = time.time()
             for ip in list(RATE.keys()):
@@ -225,13 +226,13 @@ class Server(ThreadingHTTPServer):
 class Handler(BaseHTTPRequestHandler):
     server_version = "LucarioSync/1.4.2"
     protocol_version = "HTTP/1.1"
-    # Закрываем «медленные» соединения: защита от slowloris-исчерпания потоков.
+    # Close "slow" connections: protection against slowloris thread exhaustion.
     timeout = 30
 
-    def log_message(self, fmt, *args):  # noqa: A003 — стандартный хук
+    def log_message(self, fmt, *args):  # noqa: A003 — standard hook
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {self.client_address[0]} {fmt % args}", flush=True)
 
-    # ------------------------------------------------------------- служебное
+    # ------------------------------------------------------------- helpers
     def _send(self, code: int, obj) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -263,14 +264,14 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _canonical_uuid(raw: str):
-        """Канонический вид UUID или None. Отсекает 'urn:uuid:...', {...} и прочие синонимы."""
+        """Canonical UUID form or None. Accepts 'urn:uuid:...', {...} and other equivalent spellings."""
         try:
             return str(uuidlib.UUID(raw))
         except (ValueError, AttributeError, TypeError):
             return None
 
     def _authorized(self, uuid_str: str) -> bool:
-        """Проверяет токен записи. UUID без токена — открытая запись (opt-in-модель)."""
+        """Verifies the write token. A UUID without a token is open for writing (opt-in model)."""
         with LOCK:
             rec = TOKENS.get(uuid_str)
         if rec is None:
@@ -279,13 +280,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if supplied and secrets.compare_digest(supplied.encode("utf-8"), rec["token"].encode("utf-8")):
                 return True
-        except Exception:  # noqa: BLE001 — кривой заголовок = нет доступа
+        except Exception:  # noqa: BLE001 — malformed header = no access
             pass
         self._send(401, {"error": "morph record is protected; the client authorizes itself via Mojang and sends X-Lucario-Token"})
         return False
 
     # ------------------------------------------------------------- GET
-    def do_GET(self):  # noqa: N802 — имя требуется BaseHTTPRequestHandler
+    def do_GET(self):  # noqa: N802 — name required by BaseHTTPRequestHandler
         if not self._rate_ok():
             return self._send(429, {"error": "rate limit, slow down"})
         parts = urlsplit(self.path)
@@ -307,7 +308,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, out)
         return self._send(404, {"error": "not found"})
 
-    # ------------------------------------------------------------- POST (авторизация записи)
+    # ------------------------------------------------------------- POST (record authorization)
     def do_POST(self):  # noqa: N802
         if not self._rate_ok():
             return self._send(429, {"error": "rate limit, slow down"})
@@ -328,8 +329,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "not found"})
 
     def _auth_challenge(self, data) -> None:
-        """Шаг 1: выдаёт одноразовый serverId, привязанный к IP + UUID + нику.
-        Ответ шлётся СНАРУЖИ PENDING_LOCK (никакого I/O под локом)."""
+        """Step 1: issues a one-shot serverId bound to IP + UUID + name.
+        The response is sent OUTSIDE PENDING_LOCK (no I/O under the lock)."""
         uuid_str = self._canonical_uuid(str(data.get("uuid") or ""))
         name = str(data.get("name") or "")
         if uuid_str is None or not NAME_RE.match(name):
@@ -349,14 +350,14 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, {"serverId": server_id, "ttl": int(CHALLENGE_TTL)})
 
     def _auth_verify(self, data) -> None:
-        """Шаг 3: сверяет serverId у Mojang и выдаёт/возвращает токен записи."""
+        """Step 3: checks the serverId with Mojang and issues/returns the write token."""
         uuid_str = self._canonical_uuid(str(data.get("uuid") or ""))
         name = str(data.get("name") or "")
         server_id = str(data.get("serverId") or "")
         if uuid_str is None or not NAME_RE.match(name) or not SERVER_ID_RE.match(server_id):
             return self._send(400, {"error": "bad uuid, name or serverId"})
         with PENDING_LOCK:
-            challenge = PENDING.pop(server_id, None)  # одноразовый: забрали — сгорел
+            challenge = PENDING.pop(server_id, None)  # one-shot: popped — it burns
         if (challenge is None or time.time() - challenge["ts"] > CHALLENGE_TTL
                 or challenge["uuid"] != uuid_str or challenge["name"] != name
                 or challenge["ip"] != self.client_address[0]):
@@ -369,11 +370,11 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _mojang_has_joined(name: str, server_id: str):
-        """Спрашивает Mojang: делал ли игрок с этим ником join с этим serverId?
+        """Asks Mojang: did the player with this name perform a join with this serverId?
 
-        Возвращает (ok, canonical_uuid | None). Сетевой вызов с жёстким таймаутом 8 с;
-        НИКОГДА не вызывать под LOCK/PENDING_LOCK — иначе медленный Mojang заблокирует
-        весь сервис.
+        Returns (ok, canonical_uuid | None). A network call with a hard 8 s timeout;
+        NEVER call under LOCK/PENDING_LOCK — otherwise a slow Mojang would block
+        the whole service.
         """
         url = (MOJANG_SESSION + "/session/minecraft/hasJoined?username="
                + quote(name) + "&serverId=" + server_id)
@@ -384,8 +385,8 @@ class Handler(BaseHTTPRequestHandler):
                     return False, None
                 prof = json.loads(resp.read(4096).decode("utf-8"))
         except HTTPError:
-            return False, None  # 204 и прочие не-2xx — подтверждения нет
-        except Exception:  # noqa: BLE001 — Mojang недоступен/мусор в ответе
+            return False, None  # 204 and other non-2xx — no confirmation
+        except Exception:  # noqa: BLE001 — Mojang unreachable / garbage in the response
             return False, None
         raw = prof.get("id") if isinstance(prof, dict) else None
         if not isinstance(raw, str):
@@ -461,7 +462,7 @@ def load_tokens() -> None:
                                  "name": str(v.get("name") or ""),
                                  "ts": float(v.get("ts") or time.time())}
         print(f"loaded {len(TOKENS)} write-tokens from {TOK_FILE}", flush=True)
-    except Exception as e:  # noqa: BLE001 — сервис не должен падать из-за кривого файла
+    except Exception as e:  # noqa: BLE001 — the service must not crash on a malformed file
         print(f"cannot load {TOK_FILE}: {e!r}", flush=True)
 
 
@@ -470,7 +471,7 @@ def main() -> None:
     load_tokens()
     threading.Thread(target=flusher, daemon=True).start()
     threading.Thread(target=housekeeping, daemon=True).start()
-    # SIGTERM от docker stop: выходим аккуратно, finally сохранит данные.
+    # SIGTERM from docker stop: exit cleanly; the finally block saves the data.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     server = Server(("0.0.0.0", PORT), Handler)
     ttl_desc = f"{TTL_HOURS:g} hours" if TTL_HOURS > 0 else f"{TTL_DAYS:g} days"

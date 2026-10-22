@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Заглушка sessionserver.mojang.com для интеграционных тестов сервиса синхронизации.
+A stub of sessionserver.mojang.com for the integration tests of the sync service.
 
-Эмулирует два эндпоинта, которые участвуют в авторизации записи:
+Emulates the two endpoints involved in record authorization:
 
   POST /session/minecraft/join
-       тело: {"accessToken": "...", "selectedProfile": "<uuid без дефисов>", "serverId": "<40 hex>"}
-       ответ: 204 (пусто). Запоминает пару serverId -> selectedProfile.
+       body: {"accessToken": "...", "selectedProfile": "<uuid without dashes>", "serverId": "<40 hex>"}
+       response: 204 (empty). Remembers the serverId -> selectedProfile pair.
 
   GET /session/minecraft/hasJoined?username=NAME&serverId=SID
-       ответ: 200 {"id": "<uuid без дефисов>", "name": NAME}, если join с этим serverId был;
-              204 (пусто) — если join не делали (как у настоящего Mojang).
+       response: 200 {"id": "<uuid without dashes>", "name": NAME} if a join with this serverId happened;
+              204 (empty) — if no join was made (like the real Mojang).
 
-Запуск: python3 mojang_stub.py <port>
+Run: python3 mojang_stub.py <port>
 """
 
 import json
@@ -22,14 +22,14 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-JOINS = {}  # serverId -> {"id": "<uuid без дефисов>", "name": str}
+JOINS = {}  # serverId -> {"id": "<uuid without dashes>", "name": str}
 LOCK = threading.Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, fmt, *args):  # noqa: A003 — тихая заглушка
+    def log_message(self, fmt, *args):  # noqa: A003 — silent stub
         pass
 
     # ------------------------------------------------------------- POST /join
@@ -66,10 +66,10 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             rec = JOINS.get(server_id)
         if rec is None:
-            return self._send(204)  # у настоящего Mojang «нет подтверждения» = пустой ответ
+            return self._send(204)  # the real Mojang gives "no confirmation" = an empty response
         return self._send(200, {"id": rec["id"], "name": username})
 
-    # ------------------------------------------------------------- служебное
+    # ------------------------------------------------------------- helpers
     def _send(self, code: int, obj=None) -> None:
         body = b"" if obj is None else json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
