@@ -29,7 +29,9 @@ Lucario Morph Sync — лёгкий сервис синхронизации об
   * challenge одноразовый, живёт CHALLENGE_TTL секунд и привязан к IP, UUID и нику;
   * обращение к Mojang — СНАРУЖИ всех блокировок и с жёстким таймаутом (устойчивость);
   * не больше MAX_RECORDS записей (при переполнении — 507);
-  * записи старше TTL_DAYS удаляются (клиенты обновляют свой образ при каждом входе).
+  * записи старше TTL удаляются (TTL_HOURS, при нуле — TTL_DAYS): клиенты с модом
+    1.4.2+ сами обновляют свою запись раз в heartbeatMinutes минут и при каждом
+    входе в мир, поэтому запись без обновлений — брошенная (мод удалён).
 
 Хранилище — JSON-файлы (DATA_DIR/morphs.json и DATA_DIR/tokens.json). Запись на диск
 пакетная (раз в 5 секунд при изменениях) и при остановке контейнера (SIGTERM/SIGINT).
@@ -66,6 +68,12 @@ DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DATA_FILE = os.path.join(DATA_DIR, "morphs.json")
 RATE_PER_MIN = int(os.environ.get("RATE_PER_MIN", "120"))
 TTL_DAYS = float(os.environ.get("TTL_DAYS", "30"))
+# TTL_HOURS (если > 0) перекрывает TTL_DAYS — удобно для коротких TTL (1..6 часов):
+# клиент с heartbeat обновляет запись каждые несколько минут, так что короткий TTL
+# безопасен, а брошенные записи (мод удалён) исчезают сами за TTL + HOUSEKEEPING.
+TTL_HOURS = float(os.environ.get("TTL_HOURS", "0"))
+TTL_SECONDS = int(TTL_HOURS * 3600) if TTL_HOURS > 0 else int(TTL_DAYS * 86400)
+HOUSEKEEPING_SECONDS = max(1.0, float(os.environ.get("HOUSEKEEPING_SECONDS", "3600")))
 MAX_RECORDS = int(os.environ.get("MAX_RECORDS", "100000"))
 FLUSH_SECONDS = float(os.environ.get("FLUSH_SECONDS", "5"))
 MAX_BODY = 4096
@@ -180,9 +188,9 @@ def flusher() -> None:
 
 
 def housekeeping() -> None:
-    """Раз в час выкидывает протухшие записи и подчищает счётчики rate-limit."""
+    """Раз в HOUSEKEEPING_SECONDS выкидывает протухшие записи и подчищает счётчики rate-limit."""
     while True:
-        time.sleep(3600)
+        time.sleep(HOUSEKEEPING_SECONDS)
         global DIRTY
         now = time.time()
         with PENDING_LOCK:
@@ -190,7 +198,7 @@ def housekeeping() -> None:
             for k in stale_ch:
                 del PENDING[k]
         stale = []
-        cutoff = now - TTL_DAYS * 86400
+        cutoff = now - TTL_SECONDS
         with LOCK:
             stale = [k for k, rec in STORE.items() if rec["ts"] < cutoff]
             for k in stale:
@@ -215,7 +223,7 @@ class Server(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "LucarioSync/1.2"
+    server_version = "LucarioSync/1.4.2"
     protocol_version = "HTTP/1.1"
     # Закрываем «медленные» соединения: защита от slowloris-исчерпания потоков.
     timeout = 30
@@ -370,7 +378,7 @@ class Handler(BaseHTTPRequestHandler):
         url = (MOJANG_SESSION + "/session/minecraft/hasJoined?username="
                + quote(name) + "&serverId=" + server_id)
         try:
-            req = Request(url, headers={"User-Agent": "LucarioMorphSync/1.2"})
+            req = Request(url, headers={"User-Agent": "LucarioMorphSync/1.4.2"})
             with urlopen(req, timeout=8) as resp:
                 if resp.status != 200:
                     return False, None
@@ -465,9 +473,10 @@ def main() -> None:
     # SIGTERM от docker stop: выходим аккуратно, finally сохранит данные.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     server = Server(("0.0.0.0", PORT), Handler)
+    ttl_desc = f"{TTL_HOURS:g} hours" if TTL_HOURS > 0 else f"{TTL_DAYS:g} days"
     print(f"Lucario Morph Sync listening on 0.0.0.0:{PORT} "
-          f"(variants: {len(ALLOWED)}, ttl: {TTL_DAYS} days, max records: {MAX_RECORDS}, "
-          f"flush every {FLUSH_SECONDS}s, auth via {MOJANG_SESSION}, "
+          f"(variants: {len(ALLOWED)}, ttl: {ttl_desc}, housekeeping every {HOUSEKEEPING_SECONDS:g}s, "
+          f"max records: {MAX_RECORDS}, flush every {FLUSH_SECONDS}s, auth via {MOJANG_SESSION}, "
           f"write-tokens: {len(TOKENS)})", flush=True)
     try:
         server.serve_forever()

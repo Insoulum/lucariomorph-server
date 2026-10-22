@@ -2,10 +2,11 @@
 # ============================================================================
 # Lucario Morph Sync — интеграционные тесты сервиса (без Docker).
 #
-# Поднимает три экземпляра service.py и заглушку Mojang (mojang_stub.py):
+# Поднимает четыре экземпляра service.py и заглушку Mojang (mojang_stub.py):
 #   A) основной:   RATE_PER_MIN=1000                      — API, авторизация, токены
 #   B) rate-limit: RATE_PER_MIN=5                         — проверка 429
 #   C) storage:    MAX_RECORDS=1                          — проверка 507
+#   D) ttl:        TTL_HOURS=0.003 (11 с), HOUSEKEEPING_SECONDS=2 — проверка протухания
 # и прогоняет все проверки. Итог печатается в конце: PASS/FAIL.
 #
 # Запуск:  bash tests/test_auth_flow.sh
@@ -44,13 +45,13 @@ body() {
 }
 
 # --- старт сервисов ---------------------------------------------------------
-STUB_PORT=$(free_port); A_PORT=$(free_port); B_PORT=$(free_port); C_PORT=$(free_port)
+STUB_PORT=$(free_port); A_PORT=$(free_port); B_PORT=$(free_port); C_PORT=$(free_port); D_PORT=$(free_port)
 
 python3 "$HERE/mojang_stub.py" "$STUB_PORT" > "$WORK/stub.log" 2>&1 &
 STUB_PID=$!
 
-DATA_A="$WORK/dataA"; DATA_B="$WORK/dataB"; DATA_C="$WORK/dataC"
-mkdir -p "$DATA_A" "$DATA_B" "$DATA_C"
+DATA_A="$WORK/dataA"; DATA_B="$WORK/dataB"; DATA_C="$WORK/dataC"; DATA_D="$WORK/dataD"
+mkdir -p "$DATA_A" "$DATA_B" "$DATA_C" "$DATA_D"
 
 PORT="$A_PORT" DATA_DIR="$DATA_A" RATE_PER_MIN=1000 \
   MOJANG_SESSION="http://127.0.0.1:$STUB_PORT" \
@@ -64,8 +65,12 @@ PORT="$C_PORT" DATA_DIR="$DATA_C" RATE_PER_MIN=1000 MAX_RECORDS=1 \
   MOJANG_SESSION="http://127.0.0.1:$STUB_PORT" \
   python3 "$ROOT/service.py" > "$WORK/c.log" 2>&1 &
 C_PID=$!
+PORT="$D_PORT" DATA_DIR="$DATA_D" RATE_PER_MIN=1000 TTL_HOURS=0.003 HOUSEKEEPING_SECONDS=2 \
+  MOJANG_SESSION="http://127.0.0.1:$STUB_PORT" \
+  python3 "$ROOT/service.py" > "$WORK/d.log" 2>&1 &
+D_PID=$!
 
-cleanup() { kill "$A_PID" "$B_PID" "$C_PID" "$STUB_PID" 2>/dev/null; wait 2>/dev/null; }
+cleanup() { kill "$A_PID" "$B_PID" "$C_PID" "$D_PID" "$STUB_PID" 2>/dev/null; wait 2>/dev/null; }
 trap cleanup EXIT
 
 wait_up() { # wait_up <port>
@@ -79,11 +84,12 @@ wait_up() { # wait_up <port>
 wait_up "$A_PORT" || { echo "сервис A не поднялся"; cat "$WORK/a.log"; exit 1; }
 wait_up "$B_PORT" || { echo "сервис B не поднялся"; cat "$WORK/b.log"; exit 1; }
 wait_up "$C_PORT" || { echo "сервис C не поднялся"; cat "$WORK/c.log"; exit 1; }
+wait_up "$D_PORT" || { echo "сервис D не поднялся"; cat "$WORK/d.log"; exit 1; }
 
 A="http://127.0.0.1:$A_PORT"
 
 echo "== Lucario Morph Sync: интеграционные тесты =="
-echo "==   основной сервис :$A_PORT  rate-limit сервис :$B_PORT  storage сервис :$C_PORT"
+echo "==   основной сервис :$A_PORT  rate-limit сервис :$B_PORT  storage сервис :$C_PORT  ttl сервис :$D_PORT"
 echo "==   Mojang-заглушка :$STUB_PORT"
 echo
 
@@ -194,6 +200,17 @@ n=23
 code -X PUT "http://127.0.0.1:$C_PORT/v1/morphs/$U1" -H 'Content-Type: application/json' -d '{"variant": "lucario"}' > /dev/null
 [ "$(code -X PUT "http://127.0.0.1:$C_PORT/v1/morphs/$U2" -H 'Content-Type: application/json' -d '{"variant": "lucario"}')" = "507" ]
 check $n "переполнение MAX_RECORDS -> 507 storage full" $?
+
+# --- 6. TTL записи (сервис D: TTL_HOURS=0.003 ≈ 11 с, HOUSEKEEPING_SECONDS=2) -
+n=24
+code -X PUT "http://127.0.0.1:$D_PORT/v1/morphs/$U1" -H 'Content-Type: application/json' -d '{"variant": "lucariomega"}' > /dev/null
+[ "$(body "http://127.0.0.1:$D_PORT/v1/morphs?uuids=$U1" | jsonget "['$U1']")" = "lucariomega" ]
+check $n "свежая запись (TTL-сервис) читается сразу после PUT" $?
+
+n=25
+sleep 14   # 11 с TTL + до 2 с housekeeping + запас
+[ "$(body "http://127.0.0.1:$D_PORT/v1/morphs?uuids=$U1")" = "{}" ]
+check $n "запись старше TTL удаляется housekeeping'ом" $?
 
 # --- итог ---------------------------------------------------------------------
 echo
