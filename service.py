@@ -8,13 +8,25 @@ through the Minecraft server itself on servers WITHOUT the mod. This service is 
 shared "player UUID → morph variant" store where clients publish their own morph
 and read the morphs of others.
 
-Protocol (v1):
-  GET    /health                 -> {"ok": true, "players": N}
+Protocol (v1 — morphs):
+  GET    /health                 -> {"ok": true, "players": N, "emotes": M, "live": K}
   GET    /v1/morphs?uuids=A,B,C  -> {"<uuid>": "<variant>", ...}   (known ones only)
   PUT    /v1/morphs/<uuid>       body {"variant": "lucariocaptain_shiny"} or {"variant": ""} (clear)
   DELETE /v1/morphs/<uuid>       -> clear the morph
   POST   /v1/auth/challenge      {"uuid","name"} -> {"serverId"}          (record authorization, step 1)
   POST   /v1/auth/verify         {"uuid","name","serverId"} -> {"token"}  (step 3, verified via Mojang)
+
+Protocol (v1.5 — emote animations, since 1.5.0):
+  GET    /v1/anims?uuids=A,B,C   -> {"anims": {"<uuid>": {"anim","active","ts","age"}}, "cursor": N}
+  PUT    /v1/anims/<uuid>        body {"anim": "dance", "state": "start"|"stop", "ts": <epoch ms>}
+  GET    /ws                     -> RFC 6455 WebSocket (JSON text frames), the real-time channel:
+                                  C: {"type":"hello","uuid":...}          (first message, required)
+                                  C: {"type":"watch","uuids":[...]}       (replace the interest set, <= 100)
+                                  S: {"type":"state","anims":{...},"cursor":N}  (a snapshot of the watched set)
+                                  S: {"type":"anim","uuid":...,"anim":...,"active":...,"ts":...}
+                                  Emote records live ONLY in memory (they are transient by nature): an
+                                  active record expires after ANIM_TTL_SECONDS without a refresh, and the
+                                  expiry is PUSHED to the watching sockets like a normal stop.
 
 Safety rules:
   * only UUIDs are accepted (canonicalized) and only variants from the mod's
@@ -29,6 +41,12 @@ Safety rules:
   * the challenge is one-shot, lives CHALLENGE_TTL seconds and is bound to IP, UUID and name;
   * the Mojang call happens OUTSIDE all locks and with a hard timeout (resilience);
   * no more than MAX_RECORDS records (507 when full);
+  * emote records are EPHEMERAL and stay in memory only: an active record expires after
+    ANIM_TTL_SECONDS without a refresh (the mod client re-sends it every 10 s), the expiry
+    is pushed to the watching sockets like a normal stop, and dead records are dropped later;
+  * WebSocket sockets are capped at MAX_WS_CLIENTS, their watch lists at 100 UUIDs and their
+    event queues at WS_QUEUE_MAX entries (drop-oldest) — a slow/bad socket cannot grow memory;
+  * a live socket answers pings every WS_PING_SECONDS; 35 s of silence = the socket is closed;
   * records older than TTL are removed (TTL_HOURS, or TTL_DAYS when zero): mod clients
     1.4.2+ refresh their own record every heartbeatMinutes minutes and on every world
     join, so a record without updates is abandoned (the mod was uninstalled).
@@ -36,14 +54,17 @@ Safety rules:
 Storage — JSON files (DATA_DIR/morphs.json and DATA_DIR/tokens.json). Disk writes are
 batched (every 5 seconds when there are changes) and happen on container shutdown
 (SIGTERM/SIGINT).
-No dependencies: Python 3.10+ standard library only.
+No dependencies: Python 3.10+ standard library only (WebSocket implemented by hand per
+RFC 6455 — the same thread-per-connection model as the HTTP handlers).
 """
+import base64
 import hashlib
 import json
 import os
 import re
 import secrets
 import signal
+import socket
 import sys
 import threading
 import time
@@ -80,6 +101,22 @@ FLUSH_SECONDS = float(os.environ.get("FLUSH_SECONDS", "5"))
 MAX_BODY = 4096
 MAX_UUIDS = 100
 
+# --- Emote animations (since 1.5.0): real-time push over WebSocket, HTTP fallback ---
+ANIM_RE = re.compile(r"^[a-z0-9_]{1,40}$")   # short animation names + "__tpose__"
+# An ACTIVE emote record expires after this many seconds without a refresh; mod clients
+# re-send their active emote every 10 s, so 30 s = three missed refreshes (a crashed game).
+# The expiry is pushed to the watching sockets exactly like an explicit stop.
+ANIM_TTL_SECONDS = float(os.environ.get("ANIM_TTL_SECONDS", "30"))
+ANIM_SWEEP_SECONDS = max(1.0, float(os.environ.get("ANIM_SWEEP_SECONDS", "5")))
+MAX_ANIM_RECORDS = int(os.environ.get("MAX_ANIM_RECORDS", "50000"))
+MAX_WS_CLIENTS = int(os.environ.get("MAX_WS_CLIENTS", "2000"))
+WS_PING_SECONDS = float(os.environ.get("WS_PING_SECONDS", "20"))
+WS_RECV_TIMEOUT = 35.0        # a live client replies to pings — 35 s of silence = dead socket
+WS_MAX_PAYLOAD = 8192         # a watch list of 100 UUIDs fits easily
+MAX_WATCH = 100               # watched UUIDs per socket (matches the HTTP read batch)
+WS_QUEUE_MAX = 64             # per-socket event queue ceiling (drop-oldest)
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
 # --- Record authorization (Mojang session servers) ---
 MOJANG_SESSION = os.environ.get("MOJANG_SESSION", "https://sessionserver.mojang.com").rstrip("/")
 CHALLENGE_TTL = float(os.environ.get("CHALLENGE_TTL", "300"))
@@ -93,10 +130,13 @@ TOKENS = {}                    # uuid (canonical) -> {"token", "name", "ts"}  (w
 PENDING = {}                   # serverId -> {"uuid", "name", "ip", "ts"}  (live challenges)
 DIRTY = False                  # unsaved morphs.json changes exist (under LOCK)
 TOK_DIRTY = False              # unsaved tokens.json changes exist (under LOCK)
-LOCK = threading.Lock()        # STORE/TOKENS/DIRTY/TOK_DIRTY; leaf lock: no network I/O or other locks under it
+LOCK = threading.Lock()        # STORE/TOKENS/DIRTY/TOK_DIRTY/ANIMS/ANIM_SEQ; leaf lock: no network I/O or other locks under it
 PENDING_LOCK = threading.Lock()  # PENDING; a leaf lock too
 RATE = defaultdict(deque)
 RATE_LOCK = threading.Lock()
+
+ANIMS = {}                     # uuid (canonical) -> {"anim": str, "active": bool, "ts": float} — in-memory only
+ANIM_SEQ = 0                   # global monotonic counter of anim changes (under LOCK; snapshot cursors)
 
 
 def load() -> None:
@@ -188,6 +228,344 @@ def flusher() -> None:
         flush_now()
 
 
+# ===========================================================================
+# Emote animations: store + WebSocket hub (RFC 6455, hand-rolled, no deps)
+# ===========================================================================
+
+class Session:
+    """One live WebSocket client. Fields are guarded by `cond` unless said otherwise."""
+    __slots__ = ("uuid", "watched", "queue", "cond", "alive", "wlock", "last_watch")
+
+    def __init__(self):
+        self.uuid = None            # canonical uuid of the client from "hello" (informational)
+        self.watched = frozenset()  # canonical uuids this socket receives events for (HUB lock)
+        self.queue = deque(maxlen=WS_QUEUE_MAX)  # outgoing JSON-ready events (cond)
+        self.cond = threading.Condition()
+        self.alive = True
+        self.wlock = threading.Lock()  # socket write lock: the reader (pongs) and writer (frames) share it
+        self.last_watch = 0.0       # flood guard for "watch" messages
+
+
+class Hub:
+    """Registry of WS sessions + reverse index uuid -> sessions. Own lock: a leaf lock."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.sessions = set()
+        self.index = {}             # uuid -> set of Session
+
+    def register(self, s: Session) -> bool:
+        with self.lock:
+            if len(self.sessions) >= MAX_WS_CLIENTS:
+                return False
+            self.sessions.add(s)
+            return True
+
+    def unregister(self, s: Session) -> None:
+        with self.lock:
+            self.sessions.discard(s)
+            for uuid in s.watched:
+                subs = self.index.get(uuid)
+                if subs:
+                    subs.discard(s)
+                    if not subs:
+                        del self.index[uuid]
+            s.watched = frozenset()
+
+    def set_watch(self, s: Session, uuids: frozenset) -> None:
+        """Replaces the session's interest set (and maintains the reverse index)."""
+        with self.lock:
+            for uuid in s.watched:
+                subs = self.index.get(uuid)
+                if subs:
+                    subs.discard(s)
+                    if not subs:
+                        del self.index[uuid]
+            s.watched = uuids
+            for uuid in uuids:
+                self.index.setdefault(uuid, set()).add(s)
+
+    def deliver(self, uuid: str, event: dict) -> None:
+        """Queues an event for every socket watching `uuid`. Never blocks, never does I/O:
+        the sockets' writer threads drain their own queues."""
+        with self.lock:
+            subs = self.index.get(uuid)
+            targets = list(subs) if subs else ()
+        for s in targets:
+            if not s.alive:
+                continue
+            with s.cond:
+                if s.alive:
+                    s.queue.append(event)
+                    s.cond.notify_all()
+
+    def live_count(self) -> int:
+        with self.lock:
+            return len(self.sessions)
+
+
+HUB = Hub()
+
+
+def enqueue(s: Session, event: dict) -> None:
+    """Queues an event for ONE socket (replies go through the same writer as pushes)."""
+    with s.cond:
+        if s.alive:
+            s.queue.append(event)
+            s.cond.notify_all()
+
+
+def set_anim(uuid_str: str, anim: str, start: bool, ts: float):
+    """Upserts an emote record. `ts` is the SENDER's epoch ms (echoed back so viewers can
+    order events off one clock); `at` is the server-side stamp (seconds) used for TTL and
+    age. Returns the event dict to deliver (or None if nothing changed for the watchers)
+    and an HTTP code. Call sites deliver the event OUTSIDE LOCK."""
+    global ANIM_SEQ
+    with LOCK:
+        event = None
+        if start:
+            if uuid_str not in ANIMS and len(ANIMS) >= MAX_ANIM_RECORDS:
+                return None, 507
+            ANIMS[uuid_str] = {"anim": anim, "active": True, "ts": ts, "at": time.time()}
+            ANIM_SEQ += 1
+            event = {"type": "anim", "uuid": uuid_str, "anim": anim, "active": True, "ts": ts}
+        else:
+            rec = ANIMS.get(uuid_str)
+            if rec is not None:
+                rec["active"] = False
+                rec["ts"] = ts
+                rec["at"] = time.time()
+                ANIM_SEQ += 1
+                event = {"type": "anim", "uuid": uuid_str, "anim": rec["anim"],
+                         "active": False, "ts": ts}
+        return event, 200
+
+
+def anim_sweeper() -> None:
+    """Every ANIM_SWEEP_SECONDS: expires stale ACTIVE emotes (the player crashed / lost the
+    network mid-emote) and drops long-dead records. Expiry is delivered like a normal stop,
+    so watchers always learn about it in (near) real time. The expiry event's ts is one
+    millisecond past the sender's last refresh — strictly newer on the SAME (sender) clock,
+    so clients that order by ts always accept it."""
+    while True:
+        time.sleep(ANIM_SWEEP_SECONDS)
+        now = time.time()
+        expired = []
+        dead = []
+        global ANIM_SEQ
+        with LOCK:
+            for u, rec in ANIMS.items():
+                if rec["active"]:
+                    if now - rec["at"] > ANIM_TTL_SECONDS:
+                        rec["active"] = False
+                        rec["at"] = now
+                        ANIM_SEQ += 1
+                        expired.append((u, rec["anim"], rec["ts"]))
+                elif now - rec["at"] > max(60.0, ANIM_TTL_SECONDS * 5):
+                    dead.append(u)
+            for u in dead:
+                del ANIMS[u]
+        for u, anim, last_ts in expired:
+            HUB.deliver(u, {"type": "anim", "uuid": u, "anim": anim,
+                            "active": False, "ts": last_ts + 1.0})
+
+
+# ----------------------------------------------------------------- WS frames (RFC 6455)
+
+def ws_send(s: Session, sock, opcode: int, payload: bytes) -> None:
+    """Sends one unmasked server frame. Serialized per socket (reader pongs + writer frames)."""
+    header = bytearray([0x80 | opcode])
+    n = len(payload)
+    if n < 126:
+        header.append(n)
+    elif n <= 0xFFFF:
+        header.append(126)
+        header += n.to_bytes(2, "big")
+    else:
+        header.append(127)
+        header += n.to_bytes(8, "big")
+    with s.wlock:
+        sock.sendall(bytes(header) + payload)
+
+
+def _read_exact(sock, n: int):
+    buf = bytearray()
+    while len(buf) < n:
+        try:
+            chunk = sock.recv(n - len(buf))
+        except (TimeoutError, socket.timeout):
+            raise ConnectionError("recv timeout")
+        if not chunk:
+            if not buf:
+                return None          # clean EOF between frames = the peer closed
+            raise ConnectionError("eof in the middle of a frame")
+        buf += chunk
+    return bytes(buf)
+
+
+def ws_read_message(s: Session, sock):
+    """Reads one complete DATA message (assembling continuation frames), transparently
+    answering pings. Returns (opcode, payload) with opcode 0x1/0x2, or (0x8, None) on close.
+    Raises ConnectionError on protocol violations / dead sockets."""
+    opcode = None
+    payload = bytearray()
+    while True:
+        head = _read_exact(sock, 2)
+        if head is None:
+            return 0x8, None
+        b1, b2 = head[0], head[1]
+        fin = b1 & 0x80
+        op = b1 & 0x0F
+        masked = b2 & 0x80
+        length = b2 & 0x7F
+        if not masked:
+            raise ConnectionError("client frames must be masked")
+        if length == 126:
+            ext = _read_exact(sock, 2)
+            length = int.from_bytes(ext, "big")
+        elif length == 127:
+            ext = _read_exact(sock, 8)
+            length = int.from_bytes(ext, "big")
+        if length > WS_MAX_PAYLOAD:
+            raise ConnectionError("frame too large")
+        mask = _read_exact(sock, 4)
+        data = _read_exact(sock, length) if length else b""
+        data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        if op >= 0x8:                      # control frames may ride mid-message
+            if op == 0x8:                  # close
+                try:
+                    ws_send(s, sock, 0x8, data[:2])
+                except Exception:  # noqa: BLE001 — the socket may already be gone
+                    pass
+                return 0x8, None
+            if op == 0x9:                  # ping -> pong
+                ws_send(s, sock, 0xA, data)
+                continue
+            if op == 0xA:                  # pong: proof of life
+                continue
+            raise ConnectionError("unknown control frame")
+        if op == 0x0:                      # continuation
+            if opcode is None:
+                raise ConnectionError("unexpected continuation frame")
+            payload += data
+        else:                              # text/binary start
+            if opcode is not None:
+                raise ConnectionError("expected a continuation frame")
+            opcode = op
+            payload = bytearray(data)
+        if fin:
+            return opcode, bytes(payload)
+
+
+def ws_handle_message(s: Session, payload: bytes) -> None:
+    """Client -> server messages: hello (identify) and watch (replace the interest set).
+    Both are tiny; parsing errors are silently dropped (the protocol is fire-and-forget)."""
+    try:
+        msg = json.loads(payload.decode("utf-8"))
+        if not isinstance(msg, dict):
+            return
+        typ = msg.get("type")
+        if typ == "hello":
+            u = Handler._canonical_uuid(str(msg.get("uuid") or ""))
+            if u is not None:
+                s.uuid = u
+            enqueue(s, {"type": "hello", "ok": True})
+        elif typ == "watch":
+            now = time.time()
+            if now - s.last_watch < 0.25:  # flood guard: watch replacements at most 4/s
+                return
+            s.last_watch = now
+            raw = msg.get("uuids")
+            if not isinstance(raw, list):
+                return
+            ids = []
+            for item in raw[:MAX_WATCH]:
+                u = Handler._canonical_uuid(str(item or ""))
+                if u is not None and u not in ids:
+                    ids.append(u)
+            HUB.set_watch(s, frozenset(ids))
+            wanted = set(ids)
+            with LOCK:
+                out = {u: {"anim": rec["anim"], "active": rec["active"], "ts": rec["ts"]}
+                       for u, rec in ANIMS.items() if u in wanted}
+                cursor = ANIM_SEQ
+            enqueue(s, {"type": "state", "anims": out, "cursor": cursor})
+    except Exception:  # noqa: BLE001 — a broken frame must not kill the session
+        pass
+
+
+def ws_reader(s: Session, sock) -> None:
+    """Runs in its own thread: reads client frames until close/error."""
+    try:
+        while s.alive:
+            opcode, payload = ws_read_message(s, sock)
+            if opcode == 0x8:
+                break
+            if payload:
+                ws_handle_message(s, payload)
+    except Exception:  # noqa: BLE001 — timeout/EOF/violation all mean: the session is over
+        pass
+    finally:
+        s.alive = False
+        with s.cond:
+            s.cond.notify_all()
+
+
+def ws_writer(s: Session, sock) -> None:
+    """Runs in the HTTP request thread: drains the queue, keeps the ping cadence."""
+    next_ping = time.time() + WS_PING_SECONDS
+    try:
+        while s.alive:
+            timeout = max(0.05, next_ping - time.time())
+            with s.cond:
+                if not s.queue and s.alive:
+                    s.cond.wait(timeout)
+                events = list(s.queue)
+                s.queue.clear()
+            if not s.alive:
+                break
+            for event in events:
+                ws_send(s, sock, 0x1, json.dumps(event, ensure_ascii=False,
+                                                 separators=(",", ":")).encode("utf-8"))
+            now = time.time()
+            if now >= next_ping:
+                ws_send(s, sock, 0x9, b"")
+                next_ping = now + WS_PING_SECONDS
+    except Exception:  # noqa: BLE001 — a failed send = a dead socket
+        pass
+    finally:
+        s.alive = False
+        with s.cond:
+            s.cond.notify_all()
+
+
+def run_ws_session(handler) -> None:
+    """The full life of one WebSocket connection. Occupies the request thread (like every
+    handler) + one reader thread; both exit when the session dies."""
+    sock = handler.connection
+    s = Session()
+    if not HUB.register(s):
+        try:
+            ws_send(s, sock, 0x8, (1013).to_bytes(2, "big"))  # Try Again Later
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    reader = threading.Thread(target=ws_reader, args=(s, sock), daemon=True)
+    reader.start()
+    try:
+        ws_writer(s, sock)
+    finally:
+        s.alive = False
+        with s.cond:
+            s.cond.notify_all()
+        HUB.unregister(s)
+        try:
+            sock.close()
+        except Exception:  # noqa: BLE001
+            pass
+        reader.join(timeout=2)
+
+
 def housekeeping() -> None:
     """Every HOUSEKEEPING_SECONDS, drops expired records and trims rate-limit counters."""
     while True:
@@ -220,11 +598,11 @@ def housekeeping() -> None:
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
-    request_queue_size = 64
+    request_queue_size = 128
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "LucarioSync/1.4.2"
+    server_version = "LucarioSync/1.5.0"
     protocol_version = "HTTP/1.1"
     # Close "slow" connections: protection against slowloris thread exhaustion.
     timeout = 30
@@ -292,7 +670,26 @@ class Handler(BaseHTTPRequestHandler):
         parts = urlsplit(self.path)
         if parts.path == "/health":
             with LOCK:
-                return self._send(200, {"ok": True, "players": len(STORE)})
+                active = sum(1 for rec in ANIMS.values() if rec["active"])
+                return self._send(200, {"ok": True, "players": len(STORE),
+                                        "emotes": active, "live": HUB.live_count()})
+        if parts.path == "/ws":
+            return self._ws_upgrade()
+        if parts.path == "/v1/anims":
+            raw = (parse_qs(parts.query).get("uuids") or [""])[0]
+            ids = [s.strip() for s in raw.split(",") if s.strip()][:MAX_UUIDS]
+            wanted = set()
+            for u in ids:
+                canonical = self._canonical_uuid(u)
+                if canonical is not None:
+                    wanted.add(canonical)
+            now = time.time()
+            with LOCK:
+                out = {u: {"anim": rec["anim"], "active": rec["active"], "ts": rec["ts"],
+                           "age": round(now - rec["at"], 2)}
+                       for u, rec in ANIMS.items() if u in wanted}
+                cursor = ANIM_SEQ
+            return self._send(200, {"anims": out, "cursor": cursor})
         if parts.path == "/v1/morphs":
             raw = (parse_qs(parts.query).get("uuids") or [""])[0]
             ids = [s.strip() for s in raw.split(",") if s.strip()][:MAX_UUIDS]
@@ -307,6 +704,32 @@ class Handler(BaseHTTPRequestHandler):
                         out[canonical] = rec["variant"]
             return self._send(200, out)
         return self._send(404, {"error": "not found"})
+
+    # ------------------------------------------------------------- WebSocket upgrade
+    def _ws_upgrade(self):
+        """RFC 6455 handshake on the SAME port, then the session owns the thread until the
+        socket dies. Live clients auto-reply to pings, so WS_RECV_TIMEOUT doubles as the
+        liveness check for the reader."""
+        if (self.headers.get("Upgrade") or "").lower() != "websocket" \
+                or "upgrade" not in (self.headers.get("Connection") or "").lower():
+            return self._send(400, {"error": "websocket upgrade required"})
+        key = (self.headers.get("Sec-WebSocket-Key") or "").strip()
+        if not key:
+            return self._send(400, {"error": "missing Sec-WebSocket-Key"})
+        accept = base64.b64encode(
+            hashlib.sha1((key + WS_GUID).encode("ascii")).digest()).decode("ascii")
+        self.connection.settimeout(WS_RECV_TIMEOUT)
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        try:
+            self.wfile.flush()
+        except Exception:  # noqa: BLE001 — the peer vanished mid-handshake
+            return
+        self.close_connection = True   # after the session the socket is ours to close
+        run_ws_session(self)
 
     # ------------------------------------------------------------- POST (record authorization)
     def do_POST(self):  # noqa: N802
@@ -401,6 +824,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._rate_ok():
             return self._send(429, {"error": "rate limit, slow down"})
         parts = urlsplit(self.path)
+        if parts.path.startswith("/v1/anims/"):
+            return self._anim_put(parts.path[len("/v1/anims/"):])
         if not parts.path.startswith("/v1/morphs/"):
             return self._send(404, {"error": "not found"})
         uuid_str = self._canonical_uuid(parts.path[len("/v1/morphs/"):])
@@ -423,6 +848,42 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(422, {"error": "unknown variant"})
         if not set_morph(uuid_str, variant):
             return self._send(507, {"error": "storage full"})
+        return self._send(200, {"ok": True})
+
+    def _anim_put(self, raw_uuid: str):
+        """Publishes an emote event: {"anim": "dance"|"__tpose__"|..., "state": "start"|"stop",
+        "ts": <sender epoch ms>}. Same token protection as morphs. The event is PUSHED to
+        every WS socket watching the uuid; everyone else sees it in the HTTP snapshot."""
+        uuid_str = self._canonical_uuid(raw_uuid)
+        if uuid_str is None:
+            return self._send(400, {"error": "bad uuid"})
+        if not self._authorized(uuid_str):
+            return
+        body = self._read_body()
+        if body is None:
+            return self._send(400, {"error": "missing or too large body"})
+        try:
+            data = json.loads(body.decode("utf-8"))
+            anim = data.get("anim")
+            state = data.get("state")
+            ts = data.get("ts")
+        except Exception:  # noqa: BLE001
+            return self._send(400, {"error": "bad json"})
+        if not isinstance(anim, str) or not isinstance(state, str):
+            return self._send(400, {"error": "anim and state must be strings"})
+        anim = anim.strip().lower()
+        state = state.strip().lower()
+        if state not in ("start", "stop"):
+            return self._send(400, {"error": "state must be start or stop"})
+        if state == "start" and not ANIM_RE.match(anim):
+            return self._send(422, {"error": "unknown animation name"})
+        if not isinstance(ts, (int, float)) or ts <= 0:
+            ts = time.time() * 1000.0
+        event, code = set_anim(uuid_str, anim, state == "start", float(ts))
+        if code == 507:
+            return self._send(507, {"error": "storage full"})
+        if event is not None:
+            HUB.deliver(uuid_str, event)   # outside LOCK: delivery only queues, never blocks
         return self._send(200, {"ok": True})
 
     # ------------------------------------------------------------- DELETE
@@ -471,6 +932,7 @@ def main() -> None:
     load_tokens()
     threading.Thread(target=flusher, daemon=True).start()
     threading.Thread(target=housekeeping, daemon=True).start()
+    threading.Thread(target=anim_sweeper, daemon=True).start()
     # SIGTERM from docker stop: exit cleanly; the finally block saves the data.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     server = Server(("0.0.0.0", PORT), Handler)
@@ -478,7 +940,8 @@ def main() -> None:
     print(f"Lucario Morph Sync listening on 0.0.0.0:{PORT} "
           f"(variants: {len(ALLOWED)}, ttl: {ttl_desc}, housekeeping every {HOUSEKEEPING_SECONDS:g}s, "
           f"max records: {MAX_RECORDS}, flush every {FLUSH_SECONDS}s, auth via {MOJANG_SESSION}, "
-          f"write-tokens: {len(TOKENS)})", flush=True)
+          f"write-tokens: {len(TOKENS)}; emotes: ttl {ANIM_TTL_SECONDS:g}s, sweep {ANIM_SWEEP_SECONDS:g}s, "
+          f"ws ping {WS_PING_SECONDS:g}s, max live {MAX_WS_CLIENTS})", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

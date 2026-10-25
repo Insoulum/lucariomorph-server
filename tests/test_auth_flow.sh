@@ -7,6 +7,8 @@
 #   B) rate-limit: RATE_PER_MIN=5                         — 429 check
 #   C) storage:    MAX_RECORDS=1                          — 507 check
 #   D) ttl:        TTL_HOURS=0.003 (11 s), HOUSEKEEPING_SECONDS=2 — expiration check
+# plus the emote/WS suite (tests/test_ws.py): its own service with a fast TTL —
+# push delivery over WebSocket, watch filtering, snapshots, TTL expiry.
 # and runs every check. The summary is printed at the end: PASS/FAIL.
 #
 # Run:  bash tests/test_auth_flow.sh
@@ -211,6 +213,36 @@ n=25
 sleep 14   # 11 s TTL + up to 2 s housekeeping + margin
 [ "$(body "http://127.0.0.1:$D_PORT/v1/morphs?uuids=$U1")" = "{}" ]
 check $n "a record older than TTL is removed by the housekeeping" $?
+
+# --- 7. emote animations over HTTP (service A; U3 is token-protected since section 3) ---
+n=26
+[ "$(code -X PUT "$A/v1/anims/$U1" -H 'Content-Type: application/json' -d '{"anim": "dance", "state": "start", "ts": 123}')" = "200" ]
+check $n "PUT anim start -> 200" $?
+n=27
+[ "$(body "$A/v1/anims?uuids=$U1" | jsonget "['anims']['$U1']['anim']")" = "dance" ] \
+  && [ "$(body "$A/v1/anims?uuids=$U1" | jsonget "['anims']['$U1']['active']")" = "True" ]
+check $n "GET /v1/anims returns the active emote record" $?
+n=28
+[ "$(code -X PUT "$A/v1/anims/$U1" -H 'Content-Type: application/json' -d '{"anim": "bad name!", "state": "start"}')" = "422" ]
+check $n "PUT anim with an unknown animation name -> 422" $?
+n=29
+[ "$(code -X PUT "$A/v1/anims/$U1" -H 'Content-Type: application/json' -d '{"anim": "dance", "state": "pause"}')" = "400" ]
+check $n "PUT anim with a bad state -> 400" $?
+n=30
+[ "$(code -X PUT "$A/v1/anims/$U3" -H 'Content-Type: application/json' -d '{"anim": "dance", "state": "start"}')" = "401" ]
+check $n "PUT anim to a protected UUID without a token -> 401" $?
+n=31
+[ "$(code -X PUT "$A/v1/anims/$U3" -H 'Content-Type: application/json' -H "X-Lucario-Token: $tok1" -d '{"anim": "dance", "state": "start"}')" = "200" ]
+check $n "PUT anim to a protected UUID with the token -> 200" $?
+n=32
+body -X PUT "$A/v1/anims/$U1" -H 'Content-Type: application/json' -d '{"anim": "dance", "state": "stop", "ts": 456}' > /dev/null
+[ "$(body "$A/v1/anims?uuids=$U1" | jsonget "['anims']['$U1']['active']")" = "False" ]
+check $n "PUT anim stop flips the record to inactive" $?
+
+# --- 8. the emote/WS suite (its own service: push, filtering, TTL) -------------
+n=33
+python3 "$HERE/test_ws.py" > "$WORK/ws.log" 2>&1
+check $n "emote/WS suite (see $WORK/ws.log)" $?
 
 # --- summary ------------------------------------------------------------------
 echo

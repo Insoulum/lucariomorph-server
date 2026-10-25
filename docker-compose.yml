@@ -20,5 +20,13 @@ services:
       # MOJANG_SESSION: "https://sessionserver.mojang.com"  # can be replaced with a stub for tests
       # CHALLENGE_TTL: "300"     # lifetime of a one-shot challenge, sec
       # MAX_PENDING: "10000"     # maximum unfinished challenges
+      # --- emote animations over WebSocket (since 1.5.0, same port; safe defaults) ---
+      # ANIM_TTL_SECONDS: "30"   # an active emote expires without refresh after this;
+      #                          # mod clients re-send it every 10 s, so this only bites
+      #                          # when a game crashes mid-emote (the expiry is pushed as a stop)
+      # ANIM_SWEEP_SECONDS: "5"  # how often the emote expiry sweeper runs
+      # MAX_ANIM_RECORDS: "50000"  # emote records are memory-only
+      # MAX_WS_CLIENTS: "2000"   # live WebSocket sockets ceiling
+      # WS_PING_SECONDS: "20"    # server pings; 35 s of client silence closes the socket
     volumes:
       - ./data:/data         # morphs.json (morphs) + tokens.json (tokens) — survive rebuilds

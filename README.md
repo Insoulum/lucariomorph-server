@@ -1,13 +1,16 @@
 # Lucario Morph Sync — the morph sync server
 
-A tiny HTTP service for playing
+A tiny HTTP+WebSocket service for playing
 [Lucario Morph](https://github.com/Insoulum/lucario-morph) on servers where
 **the mod itself is not installed**. Clients of the mod write "my UUID → my morph"
-here and read the morphs of other players. The data is cosmetic: UUID, variant and
-update time. The service stores nothing personal.
+here and read the morphs of other players; since 1.5.0 the same service also carries
+**real-time emote animations** (dances, the emote menu, the T-pose) between players.
+The data is cosmetic: UUID, variant and update time. The service stores nothing personal.
 
 The service is a single `service.py` file on the pure Python standard library
-(no dependencies), packaged in Docker. It consumes pennies of RAM/CPU.
+(no dependencies — the RFC 6455 WebSocket endpoint is implemented by hand),
+packaged in Docker. It consumes pennies of RAM/CPU (a load probe with 200 live
+WS clients + 20 HTTP pollers: 23 MiB RSS, p50 push latency 11 ms).
 
 ## Quick start on a VPS
 
@@ -42,10 +45,13 @@ After that, mod clients (1.4.0+) will see the service — add the address to the
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | liveness check + number of records |
+| GET | `/health` | liveness check + `players` / `emotes` / `live` (WS sockets) counts |
 | GET | `/v1/morphs?uuids=A,B,C` | morphs of the listed players (max 100 at a time) |
 | PUT | `/v1/morphs/<uuid>` | set the morph, body `{"variant": "lucariocaptain_shiny"}`; `""` — clear. A protected UUID requires the `X-Lucario-Token` header |
 | DELETE | `/v1/morphs/<uuid>` | clear the morph (also tokened if the UUID is protected) |
+| GET | `/v1/anims?uuids=A,B,C` | current emote states (snapshot; HTTP fallback of the emote channel) |
+| PUT | `/v1/anims/<uuid>` | publish an emote event, body `{"anim": "dance", "state": "start"\|"stop", "ts": <epoch ms>}`; same token protection as morphs |
+| GET | `/ws` | RFC 6455 WebSocket — the real-time emote channel (same port!) |
 | POST | `/v1/auth/challenge` | authorization step 1: `{"uuid","name"}` → `{"serverId"}` |
 | POST | `/v1/auth/verify` | authorization step 3: `{"uuid","name","serverId"}` → `{"token"}` (after checking with Mojang) |
 
@@ -65,7 +71,43 @@ curl -X DELETE http://127.0.0.1:8080/v1/morphs/069a79f4-44e9-4726-a5be-fca90e38a
 
 Only variants from the mod's whitelist are accepted (16 base ones + `_shiny` versions),
 otherwise — `422`. Junk/overload is cut off: a limit of 120 requests per minute per IP
-(`429`), body ≤ 4 KB, valid UUIDs only, a `MAX_RECORDS` storage ceiling (`507`).
+(`429`), body ≤ 4 KB, valid UUIDs only, a `MAX_RECORDS` storage ceiling (`507`),
+an animation-name whitelist `^[a-z0-9_]{1,40}$` (mod clients 1.6.x and older simply
+never call the emote endpoints — nothing breaks for them).
+
+## Emote animations (since 1.5.0 — WebSocket, same port)
+
+The mod (1.7.0+) plays emote animations of OTHER players. How it stays fast and reliable:
+
+* **publish**: an emote start/stop is a tiny `PUT /v1/anims/<uuid>` to every configured
+  mirror, fired the moment the player toggles the emote (and re-sent every 3 s until
+  accepted); an active emote re-publishes itself every 10 s;
+* **receive**: the client opens ONE WebSocket to `GET /ws` (after the HTTP upgrade the
+  connection speaks JSON text frames):
+
+```
+client                                        service
+  │ {"type":"hello","uuid":"..."}              │
+  │────────────────────────────────────────────>│ ack {"type":"hello","ok":true}
+  │ {"type":"watch","uuids":[...≤100]}          │   ← «кого я вижу» (tracked players)
+  │────────────────────────────────────────────>│ snapshot {"type":"state","anims":{...}}
+  │<────────────────────────────────────────────│
+  │            ... any watched uuid changes ...  │
+  │ {"type":"anim","uuid":...,"anim":"dance",   │
+  │<──────────── "active":true,"ts":...}─────────│   ← pushed instantly (p50 ≈ 11 ms + RTT)
+```
+
+* **only nearby**: the watch list is the client's tracked players — players outside your
+  view distance never generate traffic for you;
+* **guaranteed stop**: an explicit stop is pushed instantly; if the player's game crashes
+  mid-emote, the record expires after `ANIM_TTL_SECONDS` (30 s — three missed 10 s
+  refreshes) and the expiry is **pushed as a normal stop event** to every watcher;
+* **fallback**: while the socket is down (or an old mirror answers 404 to `/ws`) the client
+  polls `/v1/anims` every 2 s — emotes keep working, just with a little more delay;
+* **transient**: emote records live in memory only and are never written to disk — a
+  service restart simply clears them;
+* a socket that stays silent for 35 s (no pong replies) is closed; per-socket event queues
+  are capped (drop-oldest); sockets are capped at `MAX_WS_CLIENTS`.
 
 ## Record authorization (Mojang session servers, since 1.4.0)
 
@@ -130,8 +172,12 @@ token protection, token re-issue, rate limiting and storage overflow.
 
 ```bash
 bash tests/test_auth_flow.sh
-# TOTAL: PASS=25 FAIL=0
+# TOTAL: PASS=33 FAIL=0   (25 API/authorization checks + 8 emote/WS checks)
 ```
+
+The emote/WS part (`tests/test_ws.py`, client `tests/ws_probe.py`) starts its own service
+with a fast TTL and checks: push delivery, watch filtering, snapshots on watch, explicit
+stop, TTL expiry (the expiry arrives as a pushed stop), input validation and `/health`.
 
 The same suite runs automatically in GitHub Actions on every push.
 
@@ -151,6 +197,11 @@ Set via the environment in `docker-compose.yml`:
 | `MOJANG_SESSION` | `https://sessionserver.mojang.com` | address of the Mojang session server (replaced by a stub in tests) |
 | `CHALLENGE_TTL` | `300` | lifetime of a one-shot challenge, seconds |
 | `MAX_PENDING` | `10000` | maximum unfinished challenges (memory protection) |
+| `ANIM_TTL_SECONDS` | `30` | an active emote expires after this without a refresh (clients refresh every 10 s); the expiry is pushed as a stop |
+| `ANIM_SWEEP_SECONDS` | `5` | how often the emote sweeper runs (expiry + dead-record cleanup), minimum 1 |
+| `MAX_ANIM_RECORDS` | `50000` | emote store ceiling; PUT answers `507` when full |
+| `MAX_WS_CLIENTS` | `2000` | maximum live WebSocket sockets |
+| `WS_PING_SECONDS` | `20` | server ping cadence; 35 s of client silence closes the socket |
 
 ### About TTL and the client "pulse"
 
@@ -214,14 +265,22 @@ Encrypt certificate by itself) and add `https://sync.insoulum.ru` to the clients
 separate: players will need to authorize once for it as well — the mod does it by
 itself on the first 401).
 
+**WebSocket behind a proxy**: the emote channel upgrades `GET /ws` on the SAME port.
+Caddy proxies it with zero configuration. For nginx add the standard upgrade headers
+(`proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade;
+proxy_set_header Connection "upgrade";`) to the location — otherwise the mod clients
+silently fall back to the 2-second HTTP polling of `/v1/anims` (everything works,
+just a bit slower).
+
 ## Privacy
 
-* Stored: player UUID, morph variant, last update time; for authorized players — the
-  write token and name. That's all.
+* Stored on disk: player UUID, morph variant, last update time; for authorized players —
+  the write token and name. That's all. Emote records are memory-only and die with the
+  process.
 * IPs appear only in container logs (for rate limiting) and in challenge memory —
   they are never written to the data files.
 * The player's `accessToken` is **never received by the service**: the join is sent by
   the client directly to Mojang over HTTPS.
 * Without authorization, any player can "draw" any valid variant onto a foreign UUID —
-  maximum harm: a different cosmetic morph. The cure is client-side auto-authorization
-  (see "Record authorization").
+  maximum harm: a different cosmetic morph or a wrong emote animation. The cure is
+  client-side auto-authorization (see "Record authorization").
