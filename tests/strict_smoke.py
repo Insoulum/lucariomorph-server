@@ -134,8 +134,8 @@ def main():
 
         # --- strict mode: reads public, writes 401 --------------------------------
         st, h = http("GET", S1 + "/health")
-        check(2, "strict service /health -> 200, version 1.5.4",
-              st == 200 and h.get("version") == "1.5.4")
+        check(2, "strict service /health -> 200, version 1.5.5",
+              st == 200 and h.get("version") == "1.5.5")
         st, body = http("GET", S1 + f"/v1/morphs?uuids={U1}")
         check(3, "GET /v1/morphs stays public -> 200 {}", st == 200 and body == {})
         st, _ = http("PUT", S1 + f"/v1/morphs/{U1}", {"variant": "lucario"})

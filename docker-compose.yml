@@ -26,6 +26,16 @@ services:
                                # "0" restores the legacy opt-in (unclaimed = open).
       MAX_WS_PER_IP: "5"       # live WS sockets per client IP; one player needs one,
                                # 5 covers shared VPN/NAT exits, floods get 429. "0" = off.
+      # --- 1.5.5: per-socket WebSocket guards (defaults are sane; safe to leave) ---
+      # WS_BURST: "4"              # frame-token bucket per socket; EVERY frame except
+      #                            # close pays one token (hello, watch, ping, pong...)
+      # WS_REFILL_MS: "250"        # one token back per interval (legit bursts never notice)
+      # WS_DROP_KILL: "32"         # consecutive dropped frames without a paid one in
+      #                            # between = a flood -> the session is closed
+      # WS_ASSEMBLY_DEADLINE: "10" # a fragmented message must finish assembling within
+      #                            # this many seconds and obey the 8 KiB payload cap
+      # HELLO_DEADLINE: "10"       # the mod says hello right after the upgrade; a socket
+      #                            # silent this long is a scanner and gets dropped
       # --- emote animations over WebSocket (since 1.5.0, same port; safe defaults) ---
       # ANIM_TTL_SECONDS: "30"   # an active emote expires without refresh after this;
       #                          # mod clients re-send it every 10 s, so this only bites

@@ -63,6 +63,23 @@ Protocol (v1.5.4 — strict authorization by default, per-IP WS cap):
   one player needs exactly one socket, so a burst of sockets from one address is
   a flood, not a client.
 
+Protocol (v1.5.5 — per-socket hardening, red-team findings closed):
+  * frame budget (token bucket): EVERY incoming frame except close pays one token
+    (hello, watch, ping 0x9, pong 0xA, text/binary, continuation, empty frames).
+    The bucket starts at WS_BURST and refills one token per WS_REFILL_MS; an empty
+    bucket silently drops the frame, and WS_DROP_KILL consecutive drops without a
+    single paid frame in between close the session (hello/watch spam at ~57k msg/s
+    burns the budget in under a millisecond; legit bursts of 2-3 messages never do);
+  * a fragmented (continuation) message obeys the same WS_MAX_PAYLOAD cap as a
+    single frame and must finish assembling within WS_ASSEMBLY_DEADLINE seconds —
+    “many small frames = one unlimited message” and “dribble forever holding
+    partial-message memory” were real DoS vectors;
+  * hello deadline: the mod says hello right after the upgrade; a socket that
+    stayed silent for HELLO_DEADLINE seconds is a scanner — auto-ponging keeps
+    such sockets alive forever, so they are dropped and the per-IP slot freed;
+  * a non-finite emote ts (NaN/Infinity survive json.loads and nan <= 0 is False)
+    now falls back to the server clock instead of being relayed as invalid JSON.
+
 Safety rules:
   * only UUIDs are accepted (canonicalized) and only variants from the mod's
     whitelist;
@@ -85,6 +102,9 @@ Safety rules:
     per client IP (1.5.4), their watch lists at 100 UUIDs and their event queues at
     WS_QUEUE_MAX entries (drop-oldest) — a slow/bad socket cannot grow memory;
   * a live socket answers pings every WS_PING_SECONDS; 35 s of silence = the socket is closed;
+  * 1.5.5 per-socket guards: a frame budget (token bucket, close exempt), a payload cap
+    AND an assembly deadline for fragmented messages, and a HELLO_DEADLINE for silent
+    scanner sockets — a leaked/broken client cannot squat slots forever either way;
   * records older than TTL are removed (TTL_HOURS, or TTL_DAYS when zero): mod clients
     1.4.2+ refresh their own record every heartbeatMinutes minutes and on every world
     join, so a record without updates is abandoned (the mod was uninstalled).
@@ -98,6 +118,7 @@ RFC 6455 — the same thread-per-connection model as the HTTP handlers).
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -162,6 +183,21 @@ WS_RECV_TIMEOUT = 35.0        # a live client replies to pings — 35 s of silen
 WS_MAX_PAYLOAD = 8192         # a watch list of 100 UUIDs fits easily
 MAX_WATCH = 100               # watched UUIDs per socket (matches the HTTP read batch)
 WS_QUEUE_MAX = 64             # per-socket event queue ceiling (drop-oldest)
+# 1.5.5: per-socket frame budget (token bucket). Every incoming frame except close
+# costs one token; the bucket starts full at WS_BURST and refills one token per
+# WS_REFILL_MS. Empty-bucket frames are silently dropped; WS_DROP_KILL drops in a
+# row (without a single paid frame between) = a flood -> the session is closed.
+WS_BURST = int(os.environ.get("WS_BURST", "4"))
+WS_REFILL_MS = int(os.environ.get("WS_REFILL_MS", "250"))
+WS_DROP_KILL = int(os.environ.get("WS_DROP_KILL", "32"))
+# 1.5.5: a fragmented (continuation) message obeys the same payload cap as a single
+# frame and must finish assembling within WS_ASSEMBLY_DEADLINE seconds (a dribbler
+# holding partial-message memory forever was a real DoS vector).
+WS_ASSEMBLY_DEADLINE = float(os.environ.get("WS_ASSEMBLY_DEADLINE", "10"))
+# 1.5.5: the mod sends hello right after the upgrade; a socket that stays silent
+# for HELLO_DEADLINE seconds is a scanner (auto-ponging keeps it alive forever,
+# which the recv timeout alone cannot catch) -> it is dropped, its slot freed.
+HELLO_DEADLINE = float(os.environ.get("HELLO_DEADLINE", "10"))
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 # --- Record authorization (Mojang session servers) ---
@@ -289,7 +325,8 @@ def flusher() -> None:
 
 class Session:
     """One live WebSocket client. Fields are guarded by `cond` unless said otherwise."""
-    __slots__ = ("uuid", "watched", "queue", "cond", "alive", "wlock", "last_watch", "ip")
+    __slots__ = ("uuid", "watched", "queue", "cond", "alive", "wlock", "last_watch", "ip",
+                 "born", "helloed", "tokens", "tlast", "drops")
 
     def __init__(self):
         self.uuid = None            # canonical uuid of the client from "hello" (informational)
@@ -300,6 +337,11 @@ class Session:
         self.alive = True
         self.wlock = threading.Lock()  # socket write lock: the reader (pongs) and writer (frames) share it
         self.last_watch = 0.0       # flood guard for "watch" messages
+        self.born = time.time()     # 1.5.5: reference point of the hello deadline
+        self.helloed = False        # 1.5.5: hello seen (reader writes, writer reads)
+        self.tokens = float(WS_BURST)  # 1.5.5: frame-budget tokens (reader thread only)
+        self.tlast = self.born      # 1.5.5: last lazy refill timestamp (reader thread only)
+        self.drops = 0              # 1.5.5: consecutive dropped frames (reader thread only)
 
 
 class Hub:
@@ -459,6 +501,35 @@ def anim_sweeper() -> None:
 
 # ----------------------------------------------------------------- WS frames (RFC 6455)
 
+def frame_budget(s: Session) -> bool:
+    """1.5.5: the per-socket frame budget — a token bucket. EVERY incoming frame
+    except close costs one token (hello, watch, ping, pong, text/binary, empty
+    frames); the bucket starts at WS_BURST and refills one token per WS_REFILL_MS
+    lazily, by timestamp. A paid frame resets the consecutive-drop counter, a
+    dropped one (empty bucket — silent) increments it; WS_DROP_KILL consecutive
+    drops without a single paid frame in between is a flood and the caller closes
+    the session. A legit burst (a couple of watch resyncs, pongs to server pings)
+    never comes close, while 57k msg/s of hello spam burns its 32-drop budget in
+    under a millisecond of server time. Reader-thread only — no locking."""
+    now = time.time()
+    if now > s.tlast:
+        s.tokens = min(WS_BURST, s.tokens + (now - s.tlast) * (1000.0 / WS_REFILL_MS))
+        s.tlast = now
+    if s.tokens >= 1.0:
+        s.tokens -= 1.0
+        s.drops = 0
+        return True
+    return False
+
+
+def drop_tick(s: Session) -> None:
+    """Counts a silently dropped frame; WS_DROP_KILL in a row = a flood -> disconnect
+    (the caller lets the ConnectionError tear the session down, freeing the slot)."""
+    s.drops += 1
+    if s.drops >= WS_DROP_KILL:
+        raise ConnectionError("frame budget exhausted (flood)")
+
+
 def ws_send(s: Session, sock, opcode: int, payload: bytes) -> None:
     """Sends one unmasked server frame. Serialized per socket (reader pongs + writer frames)."""
     header = bytearray([0x80 | opcode])
@@ -496,6 +567,8 @@ def ws_read_message(s: Session, sock):
     Raises ConnectionError on protocol violations / dead sockets."""
     opcode = None
     payload = bytearray()
+    total = 0        # 1.5.5: bytes of the message being assembled
+    started = 0.0    # 1.5.5: when the assembly of the current message began
     while True:
         head = _read_exact(sock, 2)
         if head is None:
@@ -519,29 +592,41 @@ def ws_read_message(s: Session, sock):
         data = _read_exact(sock, length) if length else b""
         data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
         if op >= 0x8:                      # control frames may ride mid-message
-            if op == 0x8:                  # close
-                try:
+            if op == 0x8:                  # close: terminal and FREE of charge — it ends the
+                try:                       # session either way (1.5.5 budget exempt)
                     ws_send(s, sock, 0x8, data[:2])
                 except Exception:  # noqa: BLE001 — the socket may already be gone
                     pass
                 return 0x8, None
+            if op not in (0x9, 0xA):
+                raise ConnectionError("unknown control frame")
+            if not frame_budget(s):        # 1.5.5: pings AND pongs pay; close does not
+                drop_tick(s)               # raises on WS_DROP_KILL consecutive drops
+                continue                   # silent drop: no pong echo, nothing remembered
             if op == 0x9:                  # ping -> pong
                 ws_send(s, sock, 0xA, data)
-                continue
-            if op == 0xA:                  # pong: proof of life
-                continue
-            raise ConnectionError("unknown control frame")
+            continue                       # 0xA: proof of life, nothing to answer
         if op == 0x0:                      # continuation
             if opcode is None:
                 raise ConnectionError("unexpected continuation frame")
+            total += len(data)
             payload += data
         else:                              # text/binary start
             if opcode is not None:
                 raise ConnectionError("expected a continuation frame")
             opcode = op
             payload = bytearray(data)
+            total = len(data)
+            started = time.time()
+        # 1.5.5: a fragmented message obeys the same cap as a single frame and cannot
+        # be dribbled forever — every new fragment checks the assembly deadline (a
+        # fully stalled assembler dies on the recv timeout holding at most the cap).
+        if total > WS_MAX_PAYLOAD:
+            raise ConnectionError("message exceeds the payload cap")
         if fin:
             return opcode, bytes(payload)
+        if time.time() - started > WS_ASSEMBLY_DEADLINE:
+            raise ConnectionError("message assembly deadline exceeded")
 
 
 def ws_handle_message(s: Session, payload: bytes) -> None:
@@ -553,6 +638,7 @@ def ws_handle_message(s: Session, payload: bytes) -> None:
             return
         typ = msg.get("type")
         if typ == "hello":
+            s.helloed = True             # 1.5.5: stops the hello deadline (any hello counts)
             u = Handler._canonical_uuid(str(msg.get("uuid") or ""))
             if u is not None:
                 s.uuid = u
@@ -591,6 +677,9 @@ def ws_reader(s: Session, sock) -> None:
             opcode, payload = ws_read_message(s, sock)
             if opcode == 0x8:
                 break
+            if not frame_budget(s):    # 1.5.5: every assembled data message pays (empty too)
+                drop_tick(s)
+                continue               # silent drop — the drop counter decides the fate
             if payload:
                 ws_handle_message(s, payload)
     except Exception:  # noqa: BLE001 — timeout/EOF/violation all mean: the session is over
@@ -602,11 +691,18 @@ def ws_reader(s: Session, sock) -> None:
 
 
 def ws_writer(s: Session, sock) -> None:
-    """Runs in the HTTP request thread: drains the queue, keeps the ping cadence."""
-    next_ping = time.time() + WS_PING_SECONDS
+    """Runs in the HTTP request thread: drains the queue, keeps the ping cadence.
+    1.5.5: also enforces the hello deadline — the mod says hello within milliseconds,
+    so a socket silent for HELLO_DEADLINE seconds is a scanner (it may auto-pong
+    forever, which is exactly why the recv timeout cannot catch it)."""
+    deadline = s.born + HELLO_DEADLINE
+    next_ping = s.born + WS_PING_SECONDS
     try:
         while s.alive:
-            timeout = max(0.05, next_ping - time.time())
+            wake = next_ping
+            if not s.helloed and deadline < wake:
+                wake = deadline        # 1.5.5: wake up no later than the hello deadline
+            timeout = max(0.05, wake - time.time())
             with s.cond:
                 if not s.queue and s.alive:
                     s.cond.wait(timeout)
@@ -618,6 +714,8 @@ def ws_writer(s: Session, sock) -> None:
                 ws_send(s, sock, 0x1, json.dumps(event, ensure_ascii=False,
                                                  separators=(",", ":")).encode("utf-8"))
             now = time.time()
+            if not s.helloed and now > deadline:
+                break                  # silent scanner socket — drop it, free the slot
             if now >= next_ping:
                 ws_send(s, sock, 0x9, b"")
                 next_ping = now + WS_PING_SECONDS
@@ -693,7 +791,7 @@ class Server(ThreadingHTTPServer):
     request_queue_size = 128
 
 
-VERSION = "1.5.4"   # single source of truth: Server: header + /health "version" field
+VERSION = "1.5.5"   # single source of truth: Server: header + /health "version" field
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -995,8 +1093,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "state must be start or stop"})
         if state == "start" and not ANIM_RE.match(anim):
             return self._send(422, {"error": "unknown animation name"})
-        if not isinstance(ts, (int, float)) or ts <= 0:
-            ts = time.time() * 1000.0
+        if (not isinstance(ts, (int, float)) or not math.isfinite(ts) or ts <= 0):
+            ts = time.time() * 1000.0   # 1.5.5: NaN/Infinity fall back to the server clock
         event, code = set_anim(uuid_str, anim, state == "start", float(ts))
         if code == 507:
             return self._send(507, {"error": "storage full"})
@@ -1064,6 +1162,8 @@ def main() -> None:
           f"max records: {MAX_RECORDS}, flush every {FLUSH_SECONDS}s, auth via {MOJANG_SESSION}, "
           f"write-tokens: {len(TOKENS)}; emotes: ttl {ANIM_TTL_SECONDS:g}s, sweep {ANIM_SWEEP_SECONDS:g}s, "
           f"ws ping {WS_PING_SECONDS:g}s, max live {MAX_WS_CLIENTS}, max per ip {MAX_WS_PER_IP}, "
+          f"frame budget {WS_BURST}+1/{WS_REFILL_MS}ms kill {WS_DROP_KILL}, "
+          f"assembly cap {WS_MAX_PAYLOAD}B/{WS_ASSEMBLY_DEADLINE:g}s, hello deadline {HELLO_DEADLINE:g}s, "
           f"strict auth: {'on' if REQUIRE_AUTH else 'off (legacy opt-in)'})", flush=True)
     try:
         server.serve_forever()

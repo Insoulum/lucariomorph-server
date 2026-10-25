@@ -25,7 +25,7 @@ docker compose up -d --build
 
 # 3. Check:
 curl http://127.0.0.1:8080/health
-# -> {"ok": true, "version": "1.5.3", "players": 0, "mods": 0, "emotes": 0, "live": 0}
+# -> {"ok": true, "version": "1.5.5", "players": 0, "mods": 0, "emotes": 0, "live": 0}
 
 # 4. Open the port externally (if a firewall is enabled):
 ufw allow 8080/tcp        # Debian/Ubuntu
@@ -192,6 +192,42 @@ The same release also caps live WebSocket sockets per client IP
 (`MAX_WS_PER_IP=5` by default, `0` = off): one mod client holds exactly one socket,
 so five is a generous ceiling even behind a shared VPN exit; a hundred sockets from
 one address — like during a flood — are rejected with 429 before the upgrade.
+
+## Per-socket WebSocket guards (since 1.5.5)
+
+1.5.5 closes the remaining red-team findings — everything a single socket could do
+wrong, however exotic, is now bounded. None of this changes the protocol: the mod
+(1.7.x) sends hello right after connecting, speaks in tiny single frames and answers
+server pings, so it never notices any of the guards.
+
+* **Frame budget (token bucket).** Every incoming frame except `close` costs one
+  token — hello, watch, ping, pong, text/binary, even empty frames. The bucket
+  starts full at `WS_BURST=4` and refills one token per `WS_REFILL_MS=250`. A frame
+  arriving with an empty bucket is silently dropped; `WS_DROP_KILL=32` consecutive
+  drops without a single paid frame in between close the session. A legit burst
+  (a couple of watch resyncs, pongs to server pings) never comes close — while a
+  hello/watch flood at ~57k msg/s burns its 32-drop budget in under a millisecond
+  of server time, instead of pinning a core.
+* **Fragmented messages obey the same 8 KiB cap.** The per-frame payload cap existed
+  since 1.5.0, but a message split into continuation frames was assembled without a
+  limit — a proven 32 MiB memory spike per socket. The assembled total is now capped
+  at `WS_MAX_PAYLOAD` and a message that has not finished assembling within
+  `WS_ASSEMBLY_DEADLINE=10` seconds is dropped with the socket: the "one tiny frame
+  every 30 s keeps partial memory alive forever" slow-poison vector is gone.
+* **Hello deadline.** A socket that says nothing for `HELLO_DEADLINE=10` seconds is
+  a scanner, not a client. Such sockets auto-answer server pings (any WebSocket
+  library does), so the 35 s silence timeout alone can never reap them — they can
+  squat slots and threads indefinitely (a real-world leak: a buggy client leaving
+  orphaned auto-ponging sockets behind). The deadline frees the slot; the mod says
+  hello within milliseconds, so this never bites a real player.
+* **NaN/Infinity emote timestamps.** Python's `json` accepts `NaN`/`Infinity`
+  literals and `nan <= 0` is `False`, so a non-finite `ts` used to pass validation
+  and be relayed to watchers as invalid JSON. Non-finite `ts` now falls back to the
+  server clock like any other bad timestamp.
+
+All five limits are env-tunable (see docker-compose.yml) and were verified by
+`tests/guard155_smoke.py` (24 checks: floods die, paced pings survive, fragmented
+messages both work and get killed past the cap/deadline, slots are reused).
 
 ## Record authorization (Mojang session servers, since 1.4.0)
 
