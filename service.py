@@ -9,7 +9,8 @@ shared "player UUID → morph variant" store where clients publish their own mor
 and read the morphs of others.
 
 Protocol (v1 — morphs):
-  GET    /health                 -> {"ok": true, "players": N, "emotes": M, "live": K}
+  GET    /health                 -> {"ok": true, "version": "1.5.3", "players": N,
+                                             "mods": P, "emotes": M, "live": K}
   GET    /v1/morphs?uuids=A,B,C  -> {"<uuid>": "<variant>", ...}   (known ones only)
   PUT    /v1/morphs/<uuid>       body {"variant": "lucariocaptain_shiny"} or {"variant": ""} (clear)
   DELETE /v1/morphs/<uuid>       -> clear the morph
@@ -28,6 +29,40 @@ Protocol (v1.5 — emote animations, since 1.5.0):
                                   active record expires after ANIM_TTL_SECONDS without a refresh, and the
                                   expiry is PUSHED to the watching sockets like a normal stop.
 
+Protocol (v1.5.1 — morphs over the same WebSocket):
+                                  S: {"type":"morph","uuid":...,"variant":...}  (push on PUT /v1/morphs,
+                                                                 addressed via the reverse index —
+                                                                 only to sockets watching that uuid;
+                                                                 "variant": "" = the record was cleared)
+                                  S: {"type":"state",...,"morphs":{uuid:variant,...}} — the watch snapshot
+                                  now also carries the morphs (and "" = absent) of the watched set.
+                                  Heartbeat re-publication of the SAME variant pushes NOTHING.
+
+Protocol (v1.5.2 — version visibility):
+  /health includes the service version as the "version" field, so a deployment can be
+  verified with plain curl without inspecting HTTP headers (the Server: header still
+  carries the same string, LucarioSync/<version>).
+
+Protocol (v1.5.3 — presence marker):
+  The special variant "__present__" means "the mod is installed but NO morph is
+  chosen" — a permanent registration so the store can tell "mod, default skin"
+  apart from "no mod at all". It is stored/pushed/heartbeated like any morph and
+  appears in snapshots and GET polls; mod clients treat it as "no morph" (the
+  variant whitelist rejects it before rendering). /health counts marker records
+  in the "mods" field ("players" still counts ALL records).
+
+Protocol (v1.5.4 — strict authorization by default, per-IP WS cap):
+  REQUIRE_AUTH=1 (the default) turns record protection from opt-in into mandatory:
+  EVERY PUT/DELETE /v1/morphs/<uuid> and PUT /v1/anims/<uuid> requires the
+  X-Lucario-Token header; a UUID without a token answers 401 and the mod client
+  claims it AUTOMATICALLY via Mojang (challenge -> join -> verify — the flow was
+  already built in, it just used to trigger only for already-claimed records).
+  Reading (GET, /ws watch) stays public — it is what the mod needs to work.
+  REQUIRE_AUTH=0 restores the legacy opt-in behavior. Additionally, WebSocket
+  upgrades from a single IP are capped at MAX_WS_PER_IP live sockets (0 = off):
+  one player needs exactly one socket, so a burst of sockets from one address is
+  a flood, not a client.
+
 Safety rules:
   * only UUIDs are accepted (canonicalized) and only variants from the mod's
     whitelist;
@@ -36,16 +71,19 @@ Safety rules:
   * "slow" connections are closed after 30 seconds of inactivity (slowloris);
   * a UUID can be protected with a write token: the client proves account ownership
     via the Mojang session servers (challenge -> join -> verify), after which PUT/DELETE
-    for that UUID require the X-Lucario-Token header. Opt-in protection: a UUID without
-    a token is written freely (maximum harm — someone else's cosmetic morph);
+    for that UUID require the X-Lucario-Token header. 1.5.4: REQUIRE_AUTH=1 (default)
+    makes the token MANDATORY for every record; REQUIRE_AUTH=0 restores the legacy
+    opt-in behavior (a UUID without a token is written freely — maximum harm:
+    someone else's cosmetic morph);
   * the challenge is one-shot, lives CHALLENGE_TTL seconds and is bound to IP, UUID and name;
   * the Mojang call happens OUTSIDE all locks and with a hard timeout (resilience);
   * no more than MAX_RECORDS records (507 when full);
   * emote records are EPHEMERAL and stay in memory only: an active record expires after
     ANIM_TTL_SECONDS without a refresh (the mod client re-sends it every 10 s), the expiry
     is pushed to the watching sockets like a normal stop, and dead records are dropped later;
-  * WebSocket sockets are capped at MAX_WS_CLIENTS, their watch lists at 100 UUIDs and their
-    event queues at WS_QUEUE_MAX entries (drop-oldest) — a slow/bad socket cannot grow memory;
+  * WebSocket sockets are capped at MAX_WS_CLIENTS globally and at MAX_WS_PER_IP
+    per client IP (1.5.4), their watch lists at 100 UUIDs and their event queues at
+    WS_QUEUE_MAX entries (drop-oldest) — a slow/bad socket cannot grow memory;
   * a live socket answers pings every WS_PING_SECONDS; 35 s of silence = the socket is closed;
   * records older than TTL are removed (TTL_HOURS, or TTL_DAYS when zero): mod clients
     1.4.2+ refresh their own record every heartbeatMinutes minutes and on every world
@@ -82,7 +120,12 @@ BASES = [
     "lucariopmd", "lucariopsmd", "lucarioruins", "lucariospace",
     "riolu", "riolupmd", "riolupsmd",
 ]
-ALLOWED = set(BASES) | {b + "_shiny" for b in BASES}
+# 1.5.3: the presence marker — "the mod is installed, no morph chosen". Not a real
+# variant: mod clients filter it with their whitelist before rendering. It turns
+# "record absent" (unambiguous only for non-mod players) into a three-state signal:
+# absent = no mod, "__present__" = mod with default skin, anything else = mod + morph.
+PRESENT = "__present__"
+ALLOWED = set(BASES) | {b + "_shiny" for b in BASES} | {PRESENT}
 
 # --- Settings (via environment) ---
 PORT = int(os.environ.get("PORT", "8080"))
@@ -110,6 +153,10 @@ ANIM_TTL_SECONDS = float(os.environ.get("ANIM_TTL_SECONDS", "30"))
 ANIM_SWEEP_SECONDS = max(1.0, float(os.environ.get("ANIM_SWEEP_SECONDS", "5")))
 MAX_ANIM_RECORDS = int(os.environ.get("MAX_ANIM_RECORDS", "50000"))
 MAX_WS_CLIENTS = int(os.environ.get("MAX_WS_CLIENTS", "2000"))
+# 1.5.4: live WebSocket sockets per client IP. One mod client holds exactly one
+# socket, so 5 is a generous ceiling even behind a public VPN's shared NAT exit;
+# a burst of sockets from one address is a flood. 0 disables the per-IP cap.
+MAX_WS_PER_IP = int(os.environ.get("MAX_WS_PER_IP", "5"))
 WS_PING_SECONDS = float(os.environ.get("WS_PING_SECONDS", "20"))
 WS_RECV_TIMEOUT = 35.0        # a live client replies to pings — 35 s of silence = dead socket
 WS_MAX_PAYLOAD = 8192         # a watch list of 100 UUIDs fits easily
@@ -118,6 +165,10 @@ WS_QUEUE_MAX = 64             # per-socket event queue ceiling (drop-oldest)
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 # --- Record authorization (Mojang session servers) ---
+# 1.5.4: strict mode by default — every record write needs a token; a UUID without
+# one answers 401 and the mod client claims it via Mojang automatically. Reading
+# stays public. REQUIRE_AUTH=0 restores the legacy opt-in (unclaimed = open).
+REQUIRE_AUTH = os.environ.get("REQUIRE_AUTH", "1") == "1"
 MOJANG_SESSION = os.environ.get("MOJANG_SESSION", "https://sessionserver.mojang.com").rstrip("/")
 CHALLENGE_TTL = float(os.environ.get("CHALLENGE_TTL", "300"))
 MAX_PENDING = int(os.environ.get("MAX_PENDING", "10000"))
@@ -207,18 +258,22 @@ def flush_now() -> None:
             save_tokens_locked()
 
 
-def set_morph(uuid_str: str, variant: str) -> bool:
-    """Upserts a record. Returns False when the store is full."""
+def set_morph(uuid_str: str, variant: str):
+    """Upserts a record. Returns (ok, changed): ok=False when the store is full;
+    changed=True when the stored variant actually differs (a heartbeat refresh of the
+    SAME variant updates only `ts` and must not spam watchers with no-op events)."""
     global DIRTY
     with LOCK:
+        old = STORE.get(uuid_str)
+        old_variant = old["variant"] if old else None
         if variant:
             if uuid_str not in STORE and len(STORE) >= MAX_RECORDS:
-                return False
+                return False, False
             STORE[uuid_str] = {"variant": variant, "ts": time.time()}
         else:
             STORE.pop(uuid_str, None)
         DIRTY = True
-    return True
+    return True, (old_variant or "") != variant
 
 
 def flusher() -> None:
@@ -234,10 +289,11 @@ def flusher() -> None:
 
 class Session:
     """One live WebSocket client. Fields are guarded by `cond` unless said otherwise."""
-    __slots__ = ("uuid", "watched", "queue", "cond", "alive", "wlock", "last_watch")
+    __slots__ = ("uuid", "watched", "queue", "cond", "alive", "wlock", "last_watch", "ip")
 
     def __init__(self):
         self.uuid = None            # canonical uuid of the client from "hello" (informational)
+        self.ip = None              # 1.5.4: client IP — the per-IP slot is held while set
         self.watched = frozenset()  # canonical uuids this socket receives events for (HUB lock)
         self.queue = deque(maxlen=WS_QUEUE_MAX)  # outgoing JSON-ready events (cond)
         self.cond = threading.Condition()
@@ -253,6 +309,7 @@ class Hub:
         self.lock = threading.Lock()
         self.sessions = set()
         self.index = {}             # uuid -> set of Session
+        self.per_ip = {}            # 1.5.4: client IP -> reserved WS slots
 
     def register(self, s: Session) -> bool:
         with self.lock:
@@ -260,6 +317,29 @@ class Hub:
                 return False
             self.sessions.add(s)
             return True
+
+    def reserve_ip(self, ip: str) -> bool:
+        """1.5.4: atomically reserves one WS slot for a client IP, BEFORE the 101
+        response — concurrent upgrades from one address cannot slip past the cap.
+        MAX_WS_PER_IP <= 0 disables the per-IP limit."""
+        if MAX_WS_PER_IP <= 0:
+            return True
+        with self.lock:
+            if self.per_ip.get(ip, 0) >= MAX_WS_PER_IP:
+                return False
+            self.per_ip[ip] = self.per_ip.get(ip, 0) + 1
+            return True
+
+    def release_ip(self, ip: str) -> None:
+        """1.5.4: returns a reserved per-IP slot (idempotent)."""
+        if not ip:
+            return
+        with self.lock:
+            n = self.per_ip.get(ip, 0) - 1
+            if n > 0:
+                self.per_ip[ip] = n
+            else:
+                self.per_ip.pop(ip, None)
 
     def unregister(self, s: Session) -> None:
         with self.lock:
@@ -271,6 +351,13 @@ class Hub:
                     if not subs:
                         del self.index[uuid]
             s.watched = frozenset()
+            if s.ip:  # 1.5.4: the session's death frees its per-IP slot
+                n = self.per_ip.get(s.ip, 0) - 1
+                if n > 0:
+                    self.per_ip[s.ip] = n
+                else:
+                    self.per_ip.pop(s.ip, None)
+                s.ip = None
 
     def set_watch(self, s: Session, uuids: frozenset) -> None:
         """Replaces the session's interest set (and maintains the reverse index)."""
@@ -489,7 +576,10 @@ def ws_handle_message(s: Session, payload: bytes) -> None:
                 out = {u: {"anim": rec["anim"], "active": rec["active"], "ts": rec["ts"]}
                        for u, rec in ANIMS.items() if u in wanted}
                 cursor = ANIM_SEQ
-            enqueue(s, {"type": "state", "anims": out, "cursor": cursor})
+                # 1.5.1: the snapshot now carries the morphs of the watched set too —
+                # a new player's morph arrives with the same reply, no extra round-trip.
+                morphs = {u: rec["variant"] for u, rec in STORE.items() if u in wanted}
+            enqueue(s, {"type": "state", "anims": out, "cursor": cursor, "morphs": morphs})
     except Exception:  # noqa: BLE001 — a broken frame must not kill the session
         pass
 
@@ -539,12 +629,14 @@ def ws_writer(s: Session, sock) -> None:
             s.cond.notify_all()
 
 
-def run_ws_session(handler) -> None:
+def run_ws_session(handler, ip: str) -> None:
     """The full life of one WebSocket connection. Occupies the request thread (like every
     handler) + one reader thread; both exit when the session dies."""
     sock = handler.connection
     s = Session()
+    s.ip = ip   # the per-IP slot was reserved in _ws_upgrade; unregister frees it
     if not HUB.register(s):
+        HUB.release_ip(ip)   # the global cap rejected the session — give the slot back
         try:
             ws_send(s, sock, 0x8, (1013).to_bytes(2, "big"))  # Try Again Later
         except Exception:  # noqa: BLE001
@@ -601,8 +693,11 @@ class Server(ThreadingHTTPServer):
     request_queue_size = 128
 
 
+VERSION = "1.5.4"   # single source of truth: Server: header + /health "version" field
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "LucarioSync/1.5.0"
+    server_version = "LucarioSync/" + VERSION
     protocol_version = "HTTP/1.1"
     # Close "slow" connections: protection against slowloris thread exhaustion.
     timeout = 30
@@ -649,10 +744,19 @@ class Handler(BaseHTTPRequestHandler):
             return None
 
     def _authorized(self, uuid_str: str) -> bool:
-        """Verifies the write token. A UUID without a token is open for writing (opt-in model)."""
+        """Verifies the write token. 1.5.4: with REQUIRE_AUTH=1 every record write
+        needs a token — a UUID without one answers 401 and the mod client claims it
+        via Mojang automatically. REQUIRE_AUTH=0 restores the legacy opt-in model:
+        an unclaimed UUID is open for writing."""
         with LOCK:
             rec = TOKENS.get(uuid_str)
         if rec is None:
+            if REQUIRE_AUTH:
+                self._send(401, {"error": "strict mode: this record requires authorization; "
+                                          "the client claims the UUID via Mojang "
+                                          "(POST /v1/auth/challenge -> join -> /v1/auth/verify) "
+                                          "and then sends the X-Lucario-Token header"})
+                return False
             return True
         supplied = (self.headers.get("X-Lucario-Token") or "").strip()
         try:
@@ -671,8 +775,9 @@ class Handler(BaseHTTPRequestHandler):
         if parts.path == "/health":
             with LOCK:
                 active = sum(1 for rec in ANIMS.values() if rec["active"])
-                return self._send(200, {"ok": True, "players": len(STORE),
-                                        "emotes": active, "live": HUB.live_count()})
+                mods = sum(1 for rec in STORE.values() if rec["variant"] == PRESENT)
+                return self._send(200, {"ok": True, "version": VERSION, "players": len(STORE),
+                                        "mods": mods, "emotes": active, "live": HUB.live_count()})
         if parts.path == "/ws":
             return self._ws_upgrade()
         if parts.path == "/v1/anims":
@@ -716,6 +821,13 @@ class Handler(BaseHTTPRequestHandler):
         key = (self.headers.get("Sec-WebSocket-Key") or "").strip()
         if not key:
             return self._send(400, {"error": "missing Sec-WebSocket-Key"})
+        # 1.5.4: per-IP cap on live WebSocket sockets. The reservation happens BEFORE
+        # the 101 response, so concurrent upgrades from one address cannot slip past
+        # the cap; it is released on a failed handshake write, on a global-cap
+        # rejection, or on the session's normal death.
+        ip = self.client_address[0]
+        if not HUB.reserve_ip(ip):
+            return self._send(429, {"error": "too many websocket connections from this ip"})
         accept = base64.b64encode(
             hashlib.sha1((key + WS_GUID).encode("ascii")).digest()).decode("ascii")
         self.connection.settimeout(WS_RECV_TIMEOUT)
@@ -727,9 +839,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.wfile.flush()
         except Exception:  # noqa: BLE001 — the peer vanished mid-handshake
+            HUB.release_ip(ip)
             return
         self.close_connection = True   # after the session the socket is ours to close
-        run_ws_session(self)
+        run_ws_session(self, ip)
 
     # ------------------------------------------------------------- POST (record authorization)
     def do_POST(self):  # noqa: N802
@@ -846,8 +959,13 @@ class Handler(BaseHTTPRequestHandler):
         variant = variant.strip().lower()
         if variant and variant not in ALLOWED:
             return self._send(422, {"error": "unknown variant"})
-        if not set_morph(uuid_str, variant):
+        ok, changed = set_morph(uuid_str, variant)
+        if not ok:
             return self._send(507, {"error": "storage full"})
+        if changed:
+            # 1.5.1: push the change to the sockets watching THIS uuid (the HUB reverse
+            # index — never a broadcast). Outside LOCK: delivery only queues, never blocks.
+            HUB.deliver(uuid_str, {"type": "morph", "uuid": uuid_str, "variant": variant})
         return self._send(200, {"ok": True})
 
     def _anim_put(self, raw_uuid: str):
@@ -898,8 +1016,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "bad uuid"})
         if not self._authorized(uuid_str):
             return
-        if not set_morph(uuid_str, ""):
+        ok, changed = set_morph(uuid_str, "")
+        if not ok:
             return self._send(507, {"error": "storage full"})
+        if changed:
+            # 1.5.1: clearing is a change too — tell the watchers (addressed, not broadcast).
+            HUB.deliver(uuid_str, {"type": "morph", "uuid": uuid_str, "variant": ""})
         return self._send(200, {"ok": True})
 
 
@@ -941,7 +1063,8 @@ def main() -> None:
           f"(variants: {len(ALLOWED)}, ttl: {ttl_desc}, housekeeping every {HOUSEKEEPING_SECONDS:g}s, "
           f"max records: {MAX_RECORDS}, flush every {FLUSH_SECONDS}s, auth via {MOJANG_SESSION}, "
           f"write-tokens: {len(TOKENS)}; emotes: ttl {ANIM_TTL_SECONDS:g}s, sweep {ANIM_SWEEP_SECONDS:g}s, "
-          f"ws ping {WS_PING_SECONDS:g}s, max live {MAX_WS_CLIENTS})", flush=True)
+          f"ws ping {WS_PING_SECONDS:g}s, max live {MAX_WS_CLIENTS}, max per ip {MAX_WS_PER_IP}, "
+          f"strict auth: {'on' if REQUIRE_AUTH else 'off (legacy opt-in)'})", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

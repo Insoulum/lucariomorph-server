@@ -7,6 +7,11 @@
 #   B) rate-limit: RATE_PER_MIN=5                         — 429 check
 #   C) storage:    MAX_RECORDS=1                          — 507 check
 #   D) ttl:        TTL_HOURS=0.003 (11 s), HOUSEKEEPING_SECONDS=2 — expiration check
+#
+# REQUIRE_AUTH=0 everywhere: this suite exercises the DATA plane and the legacy
+# opt-in authorization. The strict mode (1.5.4 default: every write needs a token)
+# has its own suite — tests/strict_smoke.py — which also covers the per-IP
+# WebSocket cap (MAX_WS_PER_IP).
 # plus the emote/WS suite (tests/test_ws.py): its own service with a fast TTL —
 # push delivery over WebSocket, watch filtering, snapshots, TTL expiry.
 # and runs every check. The summary is printed at the end: PASS/FAIL.
@@ -55,19 +60,19 @@ STUB_PID=$!
 DATA_A="$WORK/dataA"; DATA_B="$WORK/dataB"; DATA_C="$WORK/dataC"; DATA_D="$WORK/dataD"
 mkdir -p "$DATA_A" "$DATA_B" "$DATA_C" "$DATA_D"
 
-PORT="$A_PORT" DATA_DIR="$DATA_A" RATE_PER_MIN=1000 \
+PORT="$A_PORT" DATA_DIR="$DATA_A" RATE_PER_MIN=1000 REQUIRE_AUTH=0 \
   MOJANG_SESSION="http://127.0.0.1:$STUB_PORT" \
   python3 "$ROOT/service.py" > "$WORK/a.log" 2>&1 &
 A_PID=$!
-PORT="$B_PORT" DATA_DIR="$DATA_B" RATE_PER_MIN=5 \
+PORT="$B_PORT" DATA_DIR="$DATA_B" RATE_PER_MIN=5 REQUIRE_AUTH=0 \
   MOJANG_SESSION="http://127.0.0.1:$STUB_PORT" \
   python3 "$ROOT/service.py" > "$WORK/b.log" 2>&1 &
 B_PID=$!
-PORT="$C_PORT" DATA_DIR="$DATA_C" RATE_PER_MIN=1000 MAX_RECORDS=1 \
+PORT="$C_PORT" DATA_DIR="$DATA_C" RATE_PER_MIN=1000 MAX_RECORDS=1 REQUIRE_AUTH=0 \
   MOJANG_SESSION="http://127.0.0.1:$STUB_PORT" \
   python3 "$ROOT/service.py" > "$WORK/c.log" 2>&1 &
 C_PID=$!
-PORT="$D_PORT" DATA_DIR="$DATA_D" RATE_PER_MIN=1000 TTL_HOURS=0.003 HOUSEKEEPING_SECONDS=2 \
+PORT="$D_PORT" DATA_DIR="$DATA_D" RATE_PER_MIN=1000 TTL_HOURS=0.003 HOUSEKEEPING_SECONDS=2 REQUIRE_AUTH=0 \
   MOJANG_SESSION="http://127.0.0.1:$STUB_PORT" \
   python3 "$ROOT/service.py" > "$WORK/d.log" 2>&1 &
 D_PID=$!

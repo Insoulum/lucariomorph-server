@@ -75,6 +75,9 @@ def main():
         "ANIM_TTL_SECONDS": "2",
         "ANIM_SWEEP_SECONDS": "1",
         "WS_PING_SECONDS": "2",
+        # this suite exercises the data plane, not the auth gate: run the service
+        # in legacy opt-in mode (strict mode has its own suite — strict_smoke.py)
+        "REQUIRE_AUTH": "0",
     })
     proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "service.py")],
                             env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

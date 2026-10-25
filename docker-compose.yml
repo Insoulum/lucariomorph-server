@@ -20,6 +20,12 @@ services:
       # MOJANG_SESSION: "https://sessionserver.mojang.com"  # can be replaced with a stub for tests
       # CHALLENGE_TTL: "300"     # lifetime of a one-shot challenge, sec
       # MAX_PENDING: "10000"     # maximum unfinished challenges
+      # --- 1.5.4: strict authorization + per-IP WebSocket cap (defaults are on) ---
+      REQUIRE_AUTH: "1"        # every record write needs the Mojang token; the mod
+                               # client claims itself automatically on the first 401.
+                               # "0" restores the legacy opt-in (unclaimed = open).
+      MAX_WS_PER_IP: "5"       # live WS sockets per client IP; one player needs one,
+                               # 5 covers shared VPN/NAT exits, floods get 429. "0" = off.
       # --- emote animations over WebSocket (since 1.5.0, same port; safe defaults) ---
       # ANIM_TTL_SECONDS: "30"   # an active emote expires without refresh after this;
       #                          # mod clients re-send it every 10 s, so this only bites

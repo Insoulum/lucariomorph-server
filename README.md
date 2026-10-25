@@ -25,7 +25,7 @@ docker compose up -d --build
 
 # 3. Check:
 curl http://127.0.0.1:8080/health
-# -> {"ok": true, "players": 0}
+# -> {"ok": true, "version": "1.5.3", "players": 0, "mods": 0, "emotes": 0, "live": 0}
 
 # 4. Open the port externally (if a firewall is enabled):
 ufw allow 8080/tcp        # Debian/Ubuntu
@@ -45,7 +45,7 @@ After that, mod clients (1.4.0+) will see the service — add the address to the
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | liveness check + `players` / `emotes` / `live` (WS sockets) counts |
+| GET | `/health` | liveness check + service `version` + `players` / `mods` (presence markers) / `emotes` / `live` (WS sockets) counts |
 | GET | `/v1/morphs?uuids=A,B,C` | morphs of the listed players (max 100 at a time) |
 | PUT | `/v1/morphs/<uuid>` | set the morph, body `{"variant": "lucariocaptain_shiny"}`; `""` — clear. A protected UUID requires the `X-Lucario-Token` header |
 | DELETE | `/v1/morphs/<uuid>` | clear the morph (also tokened if the UUID is protected) |
@@ -109,6 +109,90 @@ client                                        service
 * a socket that stays silent for 35 s (no pong replies) is closed; per-socket event queues
   are capped (drop-oldest); sockets are capped at `MAX_WS_CLIENTS`.
 
+## Morph changes over WebSocket (since 1.5.1)
+
+The same WebSocket also carries **morphs** now (mod 1.7.2+):
+
+* a `PUT /v1/morphs/<uuid>` (or `DELETE`) that actually changes the record pushes a
+  `{"type":"morph","uuid":...,"variant":...}` event — addressed through the same reverse
+  index, only to the sockets watching that uuid (never a broadcast); `"variant": ""`
+  means the record was cleared;
+* the `state` snapshot gained a `morphs` field: `{uuid: variant}` for the watched set —
+  a newly joined player's morph arrives with the snapshot, no extra round-trip;
+* a heartbeat refresh of the SAME variant updates only the record's `ts` and pushes
+  nothing;
+* the plain HTTP channels (`GET/PUT/DELETE /v1/morphs`) are unchanged — older mod
+  clients (1.4.x–1.7.1) keep polling them exactly as before, and unknown WS message
+  types are ignored by older clients.
+
+## Version visibility (since 1.5.2)
+
+`/health` reports the deployed service version in the `version` field, so a deployment
+can be verified with a single command — no headers, no logs:
+
+```bash
+curl http://193.164.155.75:8080/health
+# -> {"ok": true, "version": "1.5.3", "players": 2, "mods": 1, "emotes": 0, "live": 1}
+```
+
+* the same string is still in the `Server:` HTTP header of every response
+  (`Server: LucarioSync/1.5.3`) — the two always match, both come from one constant;
+* a server that answers `/health` **without** a `version` field is running a build
+  older than 1.5.2 — that alone is a reliable "you need to redeploy" marker;
+* the field is purely informational: clients ignore unknown JSON keys, so older mod
+  versions are unaffected.
+
+## Presence marker (since 1.5.3)
+
+A mod client with **no morph chosen** publishes the special variant `__present__`
+(mod 1.7.3+) instead of leaving no record. The store now distinguishes three states:
+
+| record | meaning |
+|---|---|
+| absent | the player has never published — most likely no mod |
+| `__present__` | the mod IS installed, default (vanilla) skin is worn |
+| `lucariochef`, … | the mod is installed and a morph is worn |
+
+Details:
+
+* the marker is a normal record: it is heartbeated (`heartbeatMinutes`), counted
+  against TTL and the storage cap, pushed as a `morph` event and included in the
+  `state` snapshot and GET polls like any variant;
+* `/health` reports the number of marker records in the new `mods` field
+  (`players` still counts ALL records, markers included);
+* mod clients never render the marker — the `Variants.isValid()` whitelist drops it
+  on arrival, and a marker event/snapshot value is treated exactly like "morph
+  removed";
+* older mod clients (1.4.x–1.7.1) simply ignore marker values through the same
+  whitelist. One visible trade-off: a watcher on an old client may keep the last
+  seen morph of a player who switched to the default skin (the record is no longer
+  deleted). Updating the watcher to 1.7.3 resolves it.
+
+## Strict authorization by default (since 1.5.4)
+
+Before 1.5.4 the protection was opt-in: a UUID nobody had claimed was written freely,
+so anyone who knew a player's nickname (the UUID is a public Mojang-API lookup away)
+could overwrite or even DELETE that player's record — the server had no way to tell
+"the owner publishes a heartbeat" from "a stranger is squatting". Since 1.5.4 the
+service starts in **strict mode** (`REQUIRE_AUTH=1`, the default in compose):
+
+* EVERY write — `PUT/DELETE /v1/morphs/<uuid>` and `PUT /v1/anims/<uuid>` — requires
+  the `X-Lucario-Token` header; a UUID without a token answers `401`;
+* the mod client (1.7.x) reacts to the 401 **automatically**: it runs the Mojang claim
+  chain below, stores the token in its config and retries — the player just keeps
+  playing; first join after the upgrade shows one "record protected" chat message;
+* reading stays public (GET and `/ws` watch) — that is what the mod needs to work;
+* `REQUIRE_AUTH=0` restores the legacy opt-in behavior (useful for testing or for a
+  mirror where claiming is not wanted).
+
+Squatting, overwriting and deleting other people's records now all fail with 401 —
+a token exists only where the owner proved account ownership via Mojang at least once.
+
+The same release also caps live WebSocket sockets per client IP
+(`MAX_WS_PER_IP=5` by default, `0` = off): one mod client holds exactly one socket,
+so five is a generous ceiling even behind a shared VPN exit; a hundred sockets from
+one address — like during a flood — are rejected with 429 before the upgrade.
+
 ## Record authorization (Mojang session servers, since 1.4.0)
 
 Anyone who knows someone else's UUID could write to an open store (the maximum harm —
@@ -134,7 +218,9 @@ client                          this service                       Mojang
 From then on, PUT/DELETE for that UUID require the `X-Lucario-Token: <token>` header
 (otherwise `401`). Key properties:
 
-* **opt-in protection**: a UUID without a token is written freely, as before;
+* **opt-in vs strict**: since 1.5.4 a token is required for EVERY record
+  (`REQUIRE_AUTH=1`, the default); with `REQUIRE_AUTH=0` a UUID without a token is
+  written freely, as before;
 * **the token is recoverable**: verify returns the already issued token — after deleting
   the config, the client repeats the authorization and gets the same one (no orphaned records);
 * **the service never sees the accessToken**: it is sent only directly to Mojang over HTTPS;
@@ -168,7 +254,9 @@ curl -s -X POST http://127.0.0.1:8080/v1/auth/verify \
 The integration suite starts the service locally (without Docker) plus a stub of the
 Mojang session servers (`tests/mojang_stub.py`), and runs the full cycle: API validation,
 UUID canonicalization, clearing morphs, authorization (challenge → join → verify),
-token protection, token re-issue, rate limiting and storage overflow.
+token protection, token re-issue, rate limiting and storage overflow. It runs the
+service in legacy opt-in mode (`REQUIRE_AUTH=0`) — the data plane under test is the
+same in both modes.
 
 ```bash
 bash tests/test_auth_flow.sh
@@ -178,6 +266,17 @@ bash tests/test_auth_flow.sh
 The emote/WS part (`tests/test_ws.py`, client `tests/ws_probe.py`) starts its own service
 with a fast TTL and checks: push delivery, watch filtering, snapshots on watch, explicit
 stop, TTL expiry (the expiry arrives as a pushed stop), input validation and `/health`.
+
+Strict mode and the per-IP WebSocket cap have their own suite (`tests/strict_smoke.py`,
+two service instances + the stub): tokenless writes → 401 (morphs, anims, DELETE), the
+claim chain → token, token writes → 200, cross-UUID and wrong tokens → 401, re-claim →
+same token, verify without join → no token, WS cap (the 3rd upgrade from one IP → 429,
+a freed slot is reusable) and the legacy instance still accepting tokenless writes.
+
+```bash
+python3 tests/strict_smoke.py
+# STRICT SMOKE: PASS=26 FAIL=0
+```
 
 The same suite runs automatically in GitHub Actions on every push.
 
@@ -201,6 +300,8 @@ Set via the environment in `docker-compose.yml`:
 | `ANIM_SWEEP_SECONDS` | `5` | how often the emote sweeper runs (expiry + dead-record cleanup), minimum 1 |
 | `MAX_ANIM_RECORDS` | `50000` | emote store ceiling; PUT answers `507` when full |
 | `MAX_WS_CLIENTS` | `2000` | maximum live WebSocket sockets |
+| `MAX_WS_PER_IP` | `5` | 1.5.4: live WebSocket sockets per client IP (0 = off); one player needs one |
+| `REQUIRE_AUTH` | `1` | 1.5.4: strict mode — every record write needs the Mojang token; `0` = legacy opt-in |
 | `WS_PING_SECONDS` | `20` | server ping cadence; 35 s of client silence closes the socket |
 
 ### About TTL and the client "pulse"
