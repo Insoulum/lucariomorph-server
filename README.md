@@ -25,7 +25,7 @@ docker compose up -d --build
 
 # 3. Check:
 curl http://127.0.0.1:8080/health
-# -> {"ok": true, "version": "1.5.5", "players": 0, "mods": 0, "emotes": 0, "live": 0}
+# -> {"ok": true, "version": "1.5.6", "players": 0, "mods": 0, "emotes": 0, "live": 0}
 
 # 4. Open the port externally (if a firewall is enabled):
 ufw allow 8080/tcp        # Debian/Ubuntu
@@ -228,6 +228,41 @@ server pings, so it never notices any of the guards.
 All five limits are env-tunable (see docker-compose.yml) and were verified by
 `tests/guard155_smoke.py` (24 checks: floods die, paced pings survive, fragmented
 messages both work and get killed past the cap/deadline, slots are reused).
+
+## HTTP flood protection (since 1.5.6)
+
+1.5.6 turns the HTTP side into the same "a flood cannot even reach the log" shape
+the WebSocket side got in 1.5.5 — an in-process penalty box, no fail2ban, no
+iptables knowledge required.
+
+* **The penalty box.** EVERY 429 — from the request rate limiter and from the
+  per-IP WebSocket cap alike — counts against the source IP. After `PENALTY_HITS=30`
+  rejections inside one 60 s window the IP lands in the box for `PENALTY_MINUTES=10`
+  minutes. Connections from a banned IP are closed at ACCEPT level: no thread, no
+  response, no log line — the flood becomes free for the attacker and free for the
+  server. Ban and release each log exactly one line (`[penalty] … banned/released`).
+  Legit clients never see a 429, so they never meet the box; a shared NAT exit
+  needs 30 rejections per minute to trip it, which is 15+ minutes of continuous
+  misbehaving at the mod's own retry backoff ceiling.
+* **Sampled 429 logging.** The first rejection of an IP's window logs normally;
+  the rest only bump a suppressed counter, and one summary line per minute per
+  flooding IP keeps the forensics (`[rate] 1.2.3.4: 429 x214 this window (203
+  suppressed)`). A rejected client no longer holds a keep-alive slot, and a
+  client that slams the door on a 429 leaves no reset traceback behind — a flood
+  cannot write the disk through the request log in any way.
+* **Pressure counters in /health.** `rejected` (429 total), `banned` (IPs in the
+  box right now), `banned_dropped` (connections closed at the door) and `conns`
+  (currently open HTTP/WS connections — WebSocket had `MAX_WS_CLIENTS`, plain
+  HTTP had no visibility at all). Flood pressure is now one `curl /health` away.
+* **Bounded by design.** The box holds at most `PENALTY_MAX=10000` entries,
+  housekeeping prunes expired bans and stale trackers, and live bans are never
+  evicted by newer floods (a many-IP flood cannot buy out real bans).
+
+All knobs are env-tunable (`PENALTY_HITS=0` disables the box entirely); the
+docker-compose now also ships a `logging:` rotation block so the json-file log
+has a hard 30 MB ceiling regardless of anything. Verified by
+`tests/penalty_smoke.py` (19 checks: three flood stages, both 429 sources,
+accept-level drops, TTL release, re-ban, counters, log sampling).
 
 ## Record authorization (Mojang session servers, since 1.4.0)
 

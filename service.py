@@ -9,8 +9,10 @@ shared "player UUID → morph variant" store where clients publish their own mor
 and read the morphs of others.
 
 Protocol (v1 — morphs):
-  GET    /health                 -> {"ok": true, "version": "1.5.3", "players": N,
-                                             "mods": P, "emotes": M, "live": K}
+  GET    /health                 -> {"ok": true, "version": "...", "players": N,
+                                             "mods": P, "emotes": M, "live": K,
+                                             "rejected": R, "banned": B,
+                                             "banned_dropped": D, "conns": C}
   GET    /v1/morphs?uuids=A,B,C  -> {"<uuid>": "<variant>", ...}   (known ones only)
   PUT    /v1/morphs/<uuid>       body {"variant": "lucariocaptain_shiny"} or {"variant": ""} (clear)
   DELETE /v1/morphs/<uuid>       -> clear the morph
@@ -80,6 +82,23 @@ Protocol (v1.5.5 — per-socket hardening, red-team findings closed):
   * a non-finite emote ts (NaN/Infinity survive json.loads and nan <= 0 is False)
     now falls back to the server clock instead of being relayed as invalid JSON.
 
+Protocol (v1.5.6 — HTTP flood protection, the in-process penalty box):
+  * EVERY 429 (the rate limiter and the per-IP WS cap alike) counts against the
+    client IP; PENALTY_HITS rejections inside one 60 s window put the IP into
+    the penalty box for PENALTY_MINUTES minutes;
+  * a banned IP is dropped at ACCEPT level — no thread, no response, no log
+    line: a flood becomes free for the attacker and free for the server (the
+    disk is no longer reachable through the request log);
+  * 429 logging is SAMPLED: the first rejection of an IP's window logs normally,
+    the rest only bump a suppressed counter, and one summary line per minute per
+    flooding IP keeps the forensics ("429 xN (... M suppressed)");
+  * /health reports the pressure: "rejected" (429 total), "banned" (IPs in the
+    box right now), "banned_dropped" (connections closed at the door) and
+    "conns" (currently open HTTP/WS connections — WebSocket had MAX_WS_CLIENTS,
+    plain HTTP had no visibility at all);
+  * ban and release log one line each; the box is bounded (PENALTY_MAX) and
+    pruned by housekeeping, so even a many-IP flood cannot grow it unbounded.
+
 Safety rules:
   * only UUIDs are accepted (canonicalized) and only variants from the mod's
     whitelist;
@@ -105,6 +124,10 @@ Safety rules:
   * 1.5.5 per-socket guards: a frame budget (token bucket, close exempt), a payload cap
     AND an assembly deadline for fragmented messages, and a HELLO_DEADLINE for silent
     scanner sockets — a leaked/broken client cannot squat slots forever either way;
+  * 1.5.6 HTTP guards: a per-IP penalty box (PENALTY_HITS 429s in a window ->
+    PENALTY_MINUTES of silent accept-level drops), sampled 429 logging (a flood
+    cannot fill the disk with rejected-request lines) and /health pressure
+    counters (rejected / banned / banned_dropped / conns);
   * records older than TTL are removed (TTL_HOURS, or TTL_DAYS when zero): mod clients
     1.4.2+ refresh their own record every heartbeatMinutes minutes and on every world
     join, so a record without updates is abandoned (the mod was uninstalled).
@@ -200,6 +223,15 @@ WS_ASSEMBLY_DEADLINE = float(os.environ.get("WS_ASSEMBLY_DEADLINE", "10"))
 HELLO_DEADLINE = float(os.environ.get("HELLO_DEADLINE", "10"))
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
+# 1.5.6: the HTTP penalty box — the in-process fail2ban replacement. EVERY 429
+# (the rate limiter AND the per-IP WS cap) counts against the source IP;
+# PENALTY_HITS 429s inside one 60 s window put the IP into the box for
+# PENALTY_MINUTES minutes. Connections from a banned IP are closed at accept
+# level (no thread, no response, no log). PENALTY_HITS <= 0 disables the box.
+PENALTY_HITS = int(os.environ.get("PENALTY_HITS", "30"))
+PENALTY_MINUTES = float(os.environ.get("PENALTY_MINUTES", "10"))
+PENALTY_MAX = int(os.environ.get("PENALTY_MAX", "10000"))
+
 # --- Record authorization (Mojang session servers) ---
 # 1.5.4: strict mode by default — every record write needs a token; a UUID without
 # one answers 401 and the mod client claims it via Mojang automatically. Reading
@@ -221,6 +253,12 @@ LOCK = threading.Lock()        # STORE/TOKENS/DIRTY/TOK_DIRTY/ANIMS/ANIM_SEQ; le
 PENDING_LOCK = threading.Lock()  # PENDING; a leaf lock too
 RATE = defaultdict(deque)
 RATE_LOCK = threading.Lock()
+
+# 1.5.6: the penalty box (PENALTY_LOCK is a leaf lock) + pressure counters for
+# /health. PENALTY: ip -> {"hits", "suppressed", "last_log", "window", "until"}.
+PENALTY = {}
+PENALTY_LOCK = threading.Lock()
+COUNTERS = {"rejected": 0, "banned_dropped": 0, "conns": 0}
 
 ANIMS = {}                     # uuid (canonical) -> {"anim": str, "active": bool, "ts": float} — in-memory only
 ANIM_SEQ = 0                   # global monotonic counter of anim changes (under LOCK; snapshot cursors)
@@ -497,6 +535,85 @@ def anim_sweeper() -> None:
         for u, anim, last_ts in expired:
             HUB.deliver(u, {"type": "anim", "uuid": u, "anim": anim,
                             "active": False, "ts": last_ts + 1.0})
+
+
+# ===========================================================================
+# 1.5.6: HTTP flood protection — the penalty box (fail2ban without fail2ban)
+# ===========================================================================
+
+def _penalty_prune_locked(now: float) -> None:
+    """Drops expired bans and stale tracking entries (no hits for a window).
+    Called with PENALTY_LOCK held — from housekeeping and when the box is full.
+    NEVER evicts a live ban: a many-IP flood must not buy out real bans."""
+    stale = [ip for ip, rec in PENALTY.items()
+             if rec["until"] <= now and now - rec["window"] > 60]
+    for ip in stale:
+        del PENALTY[ip]
+
+
+def penalty_hit(ip: str) -> bool:
+    """Counts one 429 for `ip` (the rate limiter or the per-IP WS cap called this).
+    Returns True when THIS is the first rejection of the IP's current 60 s window
+    — the only one that gets a per-request log line; the rest live in the
+    suppressed counter and surface in a once-per-minute summary line. After
+    PENALTY_HITS rejections inside one window the IP is banned.
+    PENALTY_HITS <= 0: counters only, nobody is ever banned.
+    Prints happen OUTSIDE PENALTY_LOCK: stdout must never stall the accept loop."""
+    now = time.time()
+    log_line = None
+    with PENALTY_LOCK:
+        COUNTERS["rejected"] += 1
+        if PENALTY_HITS <= 0:
+            return True
+        rec = PENALTY.get(ip)
+        if rec is None:
+            if len(PENALTY) >= PENALTY_MAX:
+                _penalty_prune_locked(now)
+                if len(PENALTY) >= PENALTY_MAX:
+                    return True    # box full (a many-IP flood): log normally, stay untracked
+            rec = PENALTY[ip] = {"hits": 0, "suppressed": 0,
+                                 "last_log": now, "window": now, "until": 0.0}
+        if now - rec["window"] > 60:
+            rec["window"] = now
+            rec["hits"] = 0
+            rec["last_log"] = now
+        rec["hits"] += 1
+        rec["suppressed"] += 1
+        first = rec["hits"] == 1
+        if rec["hits"] >= PENALTY_HITS:
+            rec["until"] = now + PENALTY_MINUTES * 60
+            log_line = f"[penalty] {ip} banned for {PENALTY_MINUTES:g}m (429 storm)"
+            rec["hits"] = 0
+            rec["suppressed"] = 0
+            rec["last_log"] = now
+        elif not first and now - rec["last_log"] >= 60:
+            rec["last_log"] = now
+            log_line = (f"[rate] {ip}: 429 x{rec['hits']} this window "
+                        f"({rec['suppressed']} suppressed)")
+    if log_line:
+        print(log_line, flush=True)
+    return first
+
+
+def banned(ip: str) -> bool:
+    """1.5.6: True only while `ip` has an ACTIVE ban (until > now). A mere tracking
+    entry (until == 0.0) is NOT a ban. A freshly expired ban is removed by the
+    first post-ban connection (which also logs the release). The release print
+    happens OUTSIDE PENALTY_LOCK (this runs in the accept loop)."""
+    now = time.time()
+    released = False
+    with PENALTY_LOCK:
+        rec = PENALTY.get(ip)
+        if rec is None:
+            return False
+        if rec["until"] > now:
+            return True
+        if rec["until"] > 0.0:          # an expired ban, not a tracker
+            del PENALTY[ip]
+            released = True
+    if released:
+        print(f"[penalty] {ip} released", flush=True)
+    return False
 
 
 # ----------------------------------------------------------------- WS frames (RFC 6455)
@@ -782,6 +899,8 @@ def housekeeping() -> None:
                     q.popleft()
                 if not q:
                     del RATE[ip]
+        with PENALTY_LOCK:
+            _penalty_prune_locked(now)
         if stale:
             print(f"housekeeping: dropped {len(stale)} stale records", flush=True)
 
@@ -790,8 +909,46 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 128
 
+    def handle_error(self, request, client_address):
+        # 1.5.6: a flooder closing its socket right after a 429 must not write
+        # tracebacks into the log (a client-side reset is ~15 lines of noise per
+        # request — exactly the disk-fill vector the sampling closes). Real bugs
+        # still print the full traceback.
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError,
+                            TimeoutError, socket.timeout)):
+            return
+        super().handle_error(request, client_address)
 
-VERSION = "1.5.5"   # single source of truth: Server: header + /health "version" field
+    def process_request(self, request, client_address):
+        # 1.5.6: the penalty box check runs in the accept loop BEFORE any thread,
+        # parsing or logging is spent on the connection. A banned peer gets an
+        # instant socket close: no response, no log line — nothing to write to disk.
+        if PENALTY_HITS > 0 and banned(client_address[0]):
+            with PENALTY_LOCK:
+                COUNTERS["banned_dropped"] += 1
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                request.close()
+            except OSError:
+                pass
+            return
+        with PENALTY_LOCK:
+            COUNTERS["conns"] += 1
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with PENALTY_LOCK:
+                COUNTERS["conns"] -= 1
+
+
+VERSION = "1.5.6"   # single source of truth: Server: header + /health "version" field
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -802,6 +959,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):  # noqa: A003 — standard hook
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {self.client_address[0]} {fmt % args}", flush=True)
+
+    def log_request(self, code='-', size='-'):
+        # 1.5.6: sampled 429 logging — _rejected() sets quiet_429 for the suppressed
+        # rejections so a flood cannot write the disk through the request log. The
+        # flag is consumed by the very next 429 line (send_response -> log_request).
+        if getattr(self, "quiet_429", False) and code == 429:
+            self.quiet_429 = False
+            return
+        super().log_request(code, size)
+
+    def _rejected(self):
+        """1.5.6: the single path for ALL HTTP 429s. Counts the rejection into the
+        penalty box (PENALTY_HITS in one window -> a silent accept-level ban) and
+        samples the log: the first rejection of the IP's window logs normally,
+        the rest are suppressed (only the once-per-minute summary prints).
+        The connection is closed after a 429: a rejected client must not hold a
+        keep-alive slot, and the close stays clean (no reset-traceback noise)."""
+        self.quiet_429 = not penalty_hit(self.client_address[0])
+        self.close_connection = True
+        return self._send(429, {"error": "rate limit, slow down"})
 
     # ------------------------------------------------------------- helpers
     def _send(self, code: int, obj) -> None:
@@ -868,14 +1045,23 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------- GET
     def do_GET(self):  # noqa: N802 — name required by BaseHTTPRequestHandler
         if not self._rate_ok():
-            return self._send(429, {"error": "rate limit, slow down"})
+            return self._rejected()
         parts = urlsplit(self.path)
         if parts.path == "/health":
             with LOCK:
                 active = sum(1 for rec in ANIMS.values() if rec["active"])
                 mods = sum(1 for rec in STORE.values() if rec["variant"] == PRESENT)
-                return self._send(200, {"ok": True, "version": VERSION, "players": len(STORE),
-                                        "mods": mods, "emotes": active, "live": HUB.live_count()})
+                players = len(STORE)
+            now = time.time()
+            with PENALTY_LOCK:
+                banned_now = sum(1 for rec in PENALTY.values() if rec["until"] > now)
+                rejected = COUNTERS["rejected"]
+                banned_dropped = COUNTERS["banned_dropped"]
+                conns = COUNTERS["conns"]
+            return self._send(200, {"ok": True, "version": VERSION, "players": players,
+                                    "mods": mods, "emotes": active, "live": HUB.live_count(),
+                                    "rejected": rejected, "banned": banned_now,
+                                    "banned_dropped": banned_dropped, "conns": conns})
         if parts.path == "/ws":
             return self._ws_upgrade()
         if parts.path == "/v1/anims":
@@ -925,6 +1111,9 @@ class Handler(BaseHTTPRequestHandler):
         # rejection, or on the session's normal death.
         ip = self.client_address[0]
         if not HUB.reserve_ip(ip):
+            # 1.5.6: a WS-cap rejection feeds the same penalty box and log sampling
+            self.quiet_429 = not penalty_hit(ip)
+            self.close_connection = True
             return self._send(429, {"error": "too many websocket connections from this ip"})
         accept = base64.b64encode(
             hashlib.sha1((key + WS_GUID).encode("ascii")).digest()).decode("ascii")
@@ -945,7 +1134,7 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------- POST (record authorization)
     def do_POST(self):  # noqa: N802
         if not self._rate_ok():
-            return self._send(429, {"error": "rate limit, slow down"})
+            return self._rejected()
         parts = urlsplit(self.path)
         body = self._read_body()
         if body is None:
@@ -1033,7 +1222,7 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------- PUT
     def do_PUT(self):  # noqa: N802
         if not self._rate_ok():
-            return self._send(429, {"error": "rate limit, slow down"})
+            return self._rejected()
         parts = urlsplit(self.path)
         if parts.path.startswith("/v1/anims/"):
             return self._anim_put(parts.path[len("/v1/anims/"):])
@@ -1105,7 +1294,7 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------- DELETE
     def do_DELETE(self):  # noqa: N802
         if not self._rate_ok():
-            return self._send(429, {"error": "rate limit, slow down"})
+            return self._rejected()
         parts = urlsplit(self.path)
         if not parts.path.startswith("/v1/morphs/"):
             return self._send(404, {"error": "not found"})
@@ -1164,6 +1353,8 @@ def main() -> None:
           f"ws ping {WS_PING_SECONDS:g}s, max live {MAX_WS_CLIENTS}, max per ip {MAX_WS_PER_IP}, "
           f"frame budget {WS_BURST}+1/{WS_REFILL_MS}ms kill {WS_DROP_KILL}, "
           f"assembly cap {WS_MAX_PAYLOAD}B/{WS_ASSEMBLY_DEADLINE:g}s, hello deadline {HELLO_DEADLINE:g}s, "
+          f"penalty box: {PENALTY_HITS if PENALTY_HITS > 0 else 'off'} x 429/min -> "
+          f"{PENALTY_MINUTES:g}m (max {PENALTY_MAX} ips), "
           f"strict auth: {'on' if REQUIRE_AUTH else 'off (legacy opt-in)'})", flush=True)
     try:
         server.serve_forever()

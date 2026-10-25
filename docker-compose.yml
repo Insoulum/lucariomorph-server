@@ -44,5 +44,17 @@ services:
       # MAX_ANIM_RECORDS: "50000"  # emote records are memory-only
       # MAX_WS_CLIENTS: "2000"   # live WebSocket sockets ceiling
       # WS_PING_SECONDS: "20"    # server pings; 35 s of client silence closes the socket
+      # --- 1.5.6: HTTP penalty box (defaults are sane; safe to leave) ---
+      # PENALTY_HITS: "30"       # 429s within one 60 s window (rate limiter + per-IP
+      #                          # WS cap) put the source IP into the box; "0" disables
+      # PENALTY_MINUTES: "10"    # how long a banned IP stays banned
+      # PENALTY_MAX: "10000"     # ceiling of tracked IPs (when full, new IPs are
+      #                          # answered but no longer tracked — the box cannot
+      #                          # grow unbounded; live bans are never evicted)
     volumes:
       - ./data:/data         # morphs.json (morphs) + tokens.json (tokens) — survive rebuilds
+    logging:                # 1.5.6: a hard ceiling on the json-file log (the one
+      driver: json-file     # thing a request flood could previously grow forever)
+      options:
+        max-size: "10m"
+        max-file: "3"
