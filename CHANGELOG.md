@@ -27,9 +27,9 @@ re-authorize automatically on any 401 and overwrite the stored token.
   invisible to legitimate players, while a stolen token dies on its own instead
   of living forever.
 * **Tests.** Both suites now assert rotation instead of the same-token behavior
-  (`strict_smoke.py` 17–19, `test_auth_flow.sh` 21–23), plus a legacy-file
-  migration scenario seeded into the main suite (`test_auth_flow.sh` 24–26:
-  old token still works, `tokens.json` rewritten hashed).
+  (a re-claim issues a fresh token; the old one answers 401, the new one works),
+  plus a legacy-file migration scenario seeded into the main suite (an old
+  plaintext token keeps working and `tokens.json` is rewritten hashed).
 
 ## 1.5.6 — HTTP flood protection (the in-process penalty box)
 
@@ -64,8 +64,7 @@ iptables — the server already sees every client IP, so it does the job itself.
   source addresses): three flood stages (200s → 429s → silent drops), the box
   fed by both 429 sources, accept-level drops, `/health` counters, sampled
   logging, one-line ban/release events, TTL release, re-ban, and "2 hits do
-  not ban". Full regression re-run: guard155 24/24, WS 14/14, strict 26/26,
-  auth flow 33/33.
+  not ban". Full regression re-run of every suite: green.
 
 Protocol impact: none. Old mod versions keep working exactly as before — legit
 clients never receive a 429, so they never meet the box.
