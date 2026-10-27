@@ -163,8 +163,8 @@ def main():
         S2 = f"http://127.0.0.1:{s2_port}"
         st, body = http("GET", S1 + "/health")
         h = strict_json(body)
-        check(2, "/health -> 200 and version 1.5.6 (strict JSON parse)",
-              st == 200 and h.get("version") == "1.5.6")
+        check(2, "/health -> 200 and version 1.5.7 (strict JSON parse)",
+              st == 200 and h.get("version") == "1.5.7")
 
         # --- budget: the legit cadence must survive --------------------------------
         w = WsClient(s1_port)

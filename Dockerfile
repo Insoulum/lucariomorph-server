@@ -6,7 +6,8 @@ COPY service.py /app/service.py
 ENV PORT=8080 \
     DATA_DIR=/data \
     RATE_PER_MIN=120 \
-    TTL_DAYS=30
+    TTL_DAYS=30 \
+    TOKEN_TTL_DAYS=30
 
 EXPOSE 8080
 VOLUME ["/data"]

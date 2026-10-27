@@ -172,8 +172,8 @@ def main():
         check(1, "both services started", up)
 
         st, h = health1()
-        check(2, "/health reports version 1.5.6 and the new counters",
-              st == 200 and h.get("version") == "1.5.6"
+        check(2, "/health reports version 1.5.7 and the new counters",
+              st == 200 and h.get("version") == "1.5.7"
               and h.get("rejected") == 0 and h.get("banned") == 0
               and "banned_dropped" in h and "conns" in h)
 

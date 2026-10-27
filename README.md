@@ -283,7 +283,7 @@ client                          this service                       Mojang
   │───────────────────────────────>│ GET hasJoined?username&serverId│
   │                                │───────────────────────────────>│
   │                                │<────── {"id","name"} / 204 ────│
-  │<───────── {"token": …} ─────────│ id matched → issue/return token│
+  │<───────── {"token": …} ─────────│ id matched → issue a FRESH token│
 ```
 
 From then on, PUT/DELETE for that UUID require the `X-Lucario-Token: <token>` header
@@ -292,8 +292,13 @@ From then on, PUT/DELETE for that UUID require the `X-Lucario-Token: <token>` he
 * **opt-in vs strict**: since 1.5.4 a token is required for EVERY record
   (`REQUIRE_AUTH=1`, the default); with `REQUIRE_AUTH=0` a UUID without a token is
   written freely, as before;
-* **the token is recoverable**: verify returns the already issued token — after deleting
-  the config, the client repeats the authorization and gets the same one (no orphaned records);
+* **rotation (1.5.7)**: every verify issues a NEW token — the previous one stops
+  working. The mod saves the fresh token automatically, so re-authorization is
+  invisible to players; after deleting the config the client simply repeats the
+  authorization and gets a new one (no orphaned records);
+* **tokens expire (1.5.7)**: a token is accepted only for `TOKEN_TTL_DAYS` days
+  (default 30, `0` = never) — a leaked token dies on its own instead of living
+  forever, while legitimate clients re-authorize silently on the next 401;
 * **the service never sees the accessToken**: it is sent only directly to Mojang over HTTPS;
 * verify cannot be spoofed: hasJoined returns the profile of whoever actually performed
   the join with that serverId; the challenge is one-shot and bound to IP+UUID+name;
@@ -301,9 +306,13 @@ From then on, PUT/DELETE for that UUID require the `X-Lucario-Token: <token>` he
 * the Mojang call has an 8 s timeout and runs **outside all locks** — a slow/down session
   server cannot wedge the service itself (verified with a load test).
 
-Tokens are stored in `./data/tokens.json` (uuid → token, name, issue time) and **do not
-expire** — back them up together with `morphs.json`. If the file is lost, protection
-falls off (records become open again) and players will restore it automatically at their
+Tokens are stored in `./data/tokens.json` as **SHA-256 hashes only** (uuid → hash,
+name, issue time) since 1.5.7 — the file contains no usable secrets, so a leaked
+backup or volume snapshot cannot be replayed against the service. A token issued
+before 1.5.7 (plaintext in the file) is hashed transparently on the first start and
+the file is rewritten. Back the file up together with `morphs.json` (although even a
+leaked backup no longer exposes usable tokens). If the file is lost, protection falls
+off (records become open again) and players will restore it automatically at their
 next authorization.
 
 Manually running the chain with curl (as the service sees it):
@@ -325,7 +334,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/auth/verify \
 The integration suite starts the service locally (without Docker) plus a stub of the
 Mojang session servers (`tests/mojang_stub.py`), and runs the full cycle: API validation,
 UUID canonicalization, clearing morphs, authorization (challenge → join → verify),
-token protection, token re-issue, rate limiting and storage overflow. It runs the
+token protection, token rotation (a fresh token per verify), rate limiting and storage overflow. It runs the
 service in legacy opt-in mode (`REQUIRE_AUTH=0`) — the data plane under test is the
 same in both modes.
 
@@ -341,7 +350,7 @@ stop, TTL expiry (the expiry arrives as a pushed stop), input validation and `/h
 Strict mode and the per-IP WebSocket cap have their own suite (`tests/strict_smoke.py`,
 two service instances + the stub): tokenless writes → 401 (morphs, anims, DELETE), the
 claim chain → token, token writes → 200, cross-UUID and wrong tokens → 401, re-claim →
-same token, verify without join → no token, WS cap (the 3rd upgrade from one IP → 429,
+rotated token, verify without join → no token, WS cap (the 3rd upgrade from one IP → 429,
 a freed slot is reusable) and the legacy instance still accepting tokenless writes.
 
 ```bash
@@ -373,6 +382,7 @@ Set via the environment in `docker-compose.yml`:
 | `MAX_WS_CLIENTS` | `2000` | maximum live WebSocket sockets |
 | `MAX_WS_PER_IP` | `5` | 1.5.4: live WebSocket sockets per client IP (0 = off); one player needs one |
 | `REQUIRE_AUTH` | `1` | 1.5.4: strict mode — every record write needs the Mojang token; `0` = legacy opt-in |
+| `TOKEN_TTL_DAYS` | `30` | 1.5.7: a write token expires after this many days; `0` = never. Clients re-authorize silently on the next 401, so expiry is invisible to players — but a leaked token dies on its own |
 | `WS_PING_SECONDS` | `20` | server ping cadence; 35 s of client silence closes the socket |
 
 ### About TTL and the client "pulse"

@@ -10,10 +10,11 @@ Starts a Mojang stub (mojang_stub.py) and TWO service.py instances:
 
 Covers: writes without a token -> 401 (morphs, anims, DELETE), reading stays
 public, the full claim chain via the stub (challenge -> join -> verify -> token),
-writes with the token -> 200, cross-UUID tokens are rejected, re-claim returns
-the SAME token, verify without a join -> 403, the per-IP WebSocket cap (2 live
-sockets from one IP, the 3rd upgrade -> 429, a freed slot is reusable), /health
-live counts, and the legacy instance accepting tokenless writes.
+writes with the token -> 200, cross-UUID tokens are rejected, re-claim ROTATES
+the token (a fresh one is issued, the old one stops working), verify without a
+join -> 403, the per-IP WebSocket cap (2 live sockets from one IP, the 3rd
+upgrade -> 429, a freed slot is reusable), /health live counts, and the legacy
+instance accepting tokenless writes.
 
 Run:  python3 tests/strict_smoke.py
 """
@@ -134,8 +135,8 @@ def main():
 
         # --- strict mode: reads public, writes 401 --------------------------------
         st, h = http("GET", S1 + "/health")
-        check(2, "strict service /health -> 200, version 1.5.6",
-              st == 200 and h.get("version") == "1.5.6")
+        check(2, "strict service /health -> 200, version 1.5.7",
+              st == 200 and h.get("version") == "1.5.7")
         st, body = http("GET", S1 + f"/v1/morphs?uuids={U1}")
         check(3, "GET /v1/morphs stays public -> 200 {}", st == 200 and body == {})
         st, _ = http("PUT", S1 + f"/v1/morphs/{U1}", {"variant": "lucario"})
@@ -175,25 +176,30 @@ def main():
         st, body = http("GET", S1 + f"/v1/morphs?uuids={U1}")
         check(16, "the record is gone after the authorized DELETE", body == {})
         t1b = claim(S1, stub_port, U1)
-        check(17, "re-authorization returns the SAME token", t1b == t1)
+        check(17, "re-authorization ROTATES: a fresh token is issued",
+              bool(t1b) and t1b != t1)
+        st, _ = http("PUT", S1 + f"/v1/morphs/{U1}", {"variant": "lucario"}, token=t1)
+        check(18, "the OLD token no longer works after rotation -> 401", st == 401)
+        st, _ = http("PUT", S1 + f"/v1/morphs/{U1}", {"variant": "lucariocaptain"}, token=t1b)
+        check(19, "the NEW token works after rotation -> 200", st == 200)
 
         # --- per-IP WebSocket cap (MAX_WS_PER_IP=2 on the strict instance) ---------
         w1 = WsClient(s1_port)
         w1.send({"type": "hello", "uuid": U1})
         ack = w1.recv_until(lambda m: m.get("type") == "hello", timeout=3)
-        check(18, "ws slot 1: 101 + hello ack (reading over WS stays public)",
+        check(20, "ws slot 1: 101 + hello ack (reading over WS stays public)",
               ack is not None and ack.get("ok") is True)
         w2 = WsClient(s1_port)
-        check(19, "ws slot 2: 101 (the cap is 2)", True)
+        check(21, "ws slot 2: 101 (the cap is 2)", True)
         st, _ = http("GET", S1 + "/health")
-        check(20, "/health counts the two live sockets (live: 2)",
+        check(22, "/health counts the two live sockets (live: 2)",
               st == 200 and http("GET", S1 + "/health")[1].get("live") == 2)
         third_refused = False
         try:
             WsClient(s1_port)
         except ConnectionError as e:
             third_refused = " 429 " in str(e)
-        check(21, "ws slot 3 from the same IP -> upgrade refused with 429", third_refused)
+        check(23, "ws slot 3 from the same IP -> upgrade refused with 429", third_refused)
         w1.close()
         time.sleep(0.5)
         w3 = None
@@ -202,7 +208,7 @@ def main():
             w3 = WsClient(s1_port)
         except ConnectionError as e:
             err = e
-        check(22, "a freed slot is reusable (per-IP release works)", w3 is not None)
+        check(24, "a freed slot is reusable (per-IP release works)", w3 is not None)
         w2.close()
         if w3:
             w3.close()
@@ -210,16 +216,16 @@ def main():
 
         # --- legacy instance: the old opt-in behavior is intact --------------------
         st, _ = http("PUT", S2 + f"/v1/morphs/{U1}", {"variant": "lucario"})
-        check(23, "legacy (REQUIRE_AUTH=0): PUT without a token -> 200", st == 200)
+        check(25, "legacy (REQUIRE_AUTH=0): PUT without a token -> 200", st == 200)
         st, _ = http("DELETE", S2 + f"/v1/morphs/{U1}")
-        check(24, "legacy: DELETE without a token -> 200", st == 200)
+        check(26, "legacy: DELETE without a token -> 200", st == 200)
 
         st, h = http("GET", S1 + "/health")
-        check(25, "the strict service is alive at the end (nothing crashed)",
+        check(27, "the strict service is alive at the end (nothing crashed)",
               st == 200 and h.get("ok") is True)
 
         log1 = open(os.path.join(work, "s1.log")).read()
-        check(26, "startup log says: strict auth on", "strict auth: on" in log1)
+        check(28, "startup log says: strict auth on", "strict auth: on" in log1)
     finally:
         for p in (s1, s2, stub):
             p.kill()

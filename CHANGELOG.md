@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.5.7 — rotating hashed write tokens
+
+The write token stops being a permanent secret and becomes a short-lived,
+hash-only credential. Zero changes required on the mod side: clients already
+re-authorize automatically on any 401 and overwrite the stored token.
+
+* **Rotation.** `/v1/auth/verify` issues a FRESH random token on EVERY call —
+  there is no "the same token returned forever" anymore. The mod client saves
+  the new token automatically (`serviceTokens.putAll`), so rotation is
+  invisible to players; after deleting the client config a re-authorization
+  hands out a new token the same way.
+* **Hash-only storage.** `tokens.json` now stores `uuid → {"hash": <SHA-256 of
+  the token>, "name", "ts"}`. A leaked backup or volume snapshot can no longer
+  be replayed against the service — the plaintext token exists exactly once,
+  in the verify response. The constant-time comparison
+  (`secrets.compare_digest`) is kept, now over digests.
+* **Transparent migration.** A pre-1.5.7 `tokens.json` (plaintext `"token"`
+  fields) is hashed on load and rewritten on the next flush; every existing
+  token keeps working until it expires or the client re-authorizes. The startup
+  log reports `N migrated from plaintext`.
+* **Expiry.** New env knob `TOKEN_TTL_DAYS` (default `30`, `0` = never): a
+  token older than that answers 401 like a wrong one. The record itself stays
+  protected (deleting the record would open the UUID for writing in the legacy
+  `REQUIRE_AUTH=0` mode), and the mod client re-authorizes silently — expiry is
+  invisible to legitimate players, while a stolen token dies on its own instead
+  of living forever.
+* **Tests.** Both suites now assert rotation instead of the same-token behavior
+  (`strict_smoke.py` 17–19, `test_auth_flow.sh` 21–23), plus a legacy-file
+  migration scenario seeded into the main suite (`test_auth_flow.sh` 24–26:
+  old token still works, `tokens.json` rewritten hashed).
+
 ## 1.5.6 — HTTP flood protection (the in-process penalty box)
 
 The HTTP side gets the same treatment the WebSocket side got in 1.5.5: a flood

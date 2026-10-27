@@ -24,6 +24,12 @@ services:
       REQUIRE_AUTH: "1"        # every record write needs the Mojang token; the mod
                                # client claims itself automatically on the first 401.
                                # "0" restores the legacy opt-in (unclaimed = open).
+      # --- 1.5.7: rotating hashed tokens (defaults are sane; safe to leave) ---
+      # TOKEN_TTL_DAYS: "30"   # a write token expires after N days (0 = never).
+                               # Clients re-authorize silently on the next 401, so
+                               # expiry is invisible to players — but a leaked
+                               # token dies on its own instead of living forever.
+                               # tokens.json stores SHA-256 hashes only.
       MAX_WS_PER_IP: "5"       # live WS sockets per client IP; one player needs one,
                                # 5 covers shared VPN/NAT exits, floods get 429. "0" = off.
       # --- 1.5.5: per-socket WebSocket guards (defaults are sane; safe to leave) ---

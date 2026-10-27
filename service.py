@@ -82,6 +82,22 @@ Protocol (v1.5.5 — per-socket hardening, red-team findings closed):
   * a non-finite emote ts (NaN/Infinity survive json.loads and nan <= 0 is False)
     now falls back to the server clock instead of being relayed as invalid JSON.
 
+Tokens (v1.5.7 — rotating hashed write tokens):
+  * a fresh random token is issued on EVERY successful verify (rotation):
+    there is no "permanent token" anymore — a stolen token lives at most
+    TOKEN_TTL_DAYS (default 30, 0 = never expires) instead of forever;
+  * tokens are stored ONLY as SHA-256 hashes: tokens.json contains no usable
+    secrets, so a leaked backup/volume snapshot cannot be replayed against
+    the service; the plaintext token exists once — in the verify response;
+  * tokens.json from 1.5.6 and earlier (plaintext "token" fields) migrates
+    transparently on load: the hash is computed from the stored value and the
+    file is rewritten hashed — old clients keep their working tokens until
+    the TTL expires or they re-authorize (whichever comes first);
+  * an EXPIRED token answers 401 like a wrong one, but the record stays
+    protected (deleting the record would open the UUID for writing in the
+    legacy REQUIRE_AUTH=0 mode). The mod client re-authorizes automatically
+    on any 401 and saves the fresh token — expiry is invisible to players.
+
 Protocol (v1.5.6 — HTTP flood protection, the in-process penalty box):
   * EVERY 429 (the rate limiter and the per-IP WS cap alike) counts against the
     client IP; PENALTY_HITS rejections inside one 60 s window put the IP into
@@ -240,12 +256,16 @@ REQUIRE_AUTH = os.environ.get("REQUIRE_AUTH", "1") == "1"
 MOJANG_SESSION = os.environ.get("MOJANG_SESSION", "https://sessionserver.mojang.com").rstrip("/")
 CHALLENGE_TTL = float(os.environ.get("CHALLENGE_TTL", "300"))
 MAX_PENDING = int(os.environ.get("MAX_PENDING", "10000"))
+# 1.5.7: a token expires after TOKEN_TTL_DAYS (0 = never). The mod client
+# re-authorizes automatically on the next 401, so expiry is invisible to
+# legitimate players — but a leaked token dies on its own instead of living forever.
+TOKEN_TTL_DAYS = float(os.environ.get("TOKEN_TTL_DAYS", "30"))
 TOK_FILE = os.path.join(DATA_DIR, "tokens.json")
 NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
 SERVER_ID_RE = re.compile(r"^[0-9a-f]{40}$")
 
 STORE = {}                     # uuid (canonical) -> {"variant": str, "ts": float}
-TOKENS = {}                    # uuid (canonical) -> {"token", "name", "ts"}  (write tokens)
+TOKENS = {}                    # uuid (canonical) -> {"hash": <sha256 hex>, "name", "ts"}  (write tokens; 1.5.7: hash only, never plaintext)
 PENDING = {}                   # serverId -> {"uuid", "name", "ip", "ts"}  (live challenges)
 DIRTY = False                  # unsaved morphs.json changes exist (under LOCK)
 TOK_DIRTY = False              # unsaved tokens.json changes exist (under LOCK)
@@ -303,19 +323,20 @@ def save_tokens_locked() -> None:
 
 
 def set_token(uuid_str: str, name: str) -> str:
-    """Creates or returns the existing write token of a UUID.
+    """Issues a FRESH write token for a UUID (1.5.7: rotation on every verify).
 
-    An already issued token is returned as is — this is how the client regains
-    access after deleting its config: identity is re-proven via Mojang,
-    and the service hands out the same token.
+    Every successful authorization generates a new random token and stores ONLY
+    its SHA-256 hash — the plaintext exists once, in the verify response, and is
+    saved by the client into its config. The client regains access after deleting
+    its config the same way it got the first token: identity is re-proven via
+    Mojang and the verify response hands it the new token (the mod overwrites
+    the old one automatically). Tokens expire after TOKEN_TTL_DAYS (0 = never).
     """
     global TOK_DIRTY
+    tok = secrets.token_urlsafe(32)
     with LOCK:
-        rec = TOKENS.get(uuid_str)
-        if rec is not None:
-            return rec["token"]
-        tok = secrets.token_urlsafe(32)
-        TOKENS[uuid_str] = {"token": tok, "name": name, "ts": time.time()}
+        TOKENS[uuid_str] = {"hash": hashlib.sha256(tok.encode("utf-8")).hexdigest(),
+                            "name": name, "ts": time.time()}
         TOK_DIRTY = True
     return tok
 
@@ -948,7 +969,7 @@ class Server(ThreadingHTTPServer):
                 COUNTERS["conns"] -= 1
 
 
-VERSION = "1.5.6"   # single source of truth: Server: header + /health "version" field
+VERSION = "1.5.7"   # single source of truth: Server: header + /health "version" field
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1022,7 +1043,12 @@ class Handler(BaseHTTPRequestHandler):
         """Verifies the write token. 1.5.4: with REQUIRE_AUTH=1 every record write
         needs a token — a UUID without one answers 401 and the mod client claims it
         via Mojang automatically. REQUIRE_AUTH=0 restores the legacy opt-in model:
-        an unclaimed UUID is open for writing."""
+        an unclaimed UUID is open for writing. 1.5.7: the supplied token is hashed
+        and compared against the stored SHA-256 digest (plaintext is never kept),
+        and a token older than TOKEN_TTL_DAYS is rejected as expired — the record
+        STAYS protected either way (dropping the record would open the UUID for
+        writing in legacy mode); the mod client re-authorizes on any 401 and gets
+        a fresh token."""
         with LOCK:
             rec = TOKENS.get(uuid_str)
         if rec is None:
@@ -1034,12 +1060,21 @@ class Handler(BaseHTTPRequestHandler):
                 return False
             return True
         supplied = (self.headers.get("X-Lucario-Token") or "").strip()
+        ok, expired = False, False
         try:
-            if supplied and secrets.compare_digest(supplied.encode("utf-8"), rec["token"].encode("utf-8")):
-                return True
+            if supplied and rec.get("hash"):
+                age_days = (time.time() - float(rec.get("ts") or 0)) / 86400.0
+                expired = 0 < TOKEN_TTL_DAYS < age_days
+                if not expired:
+                    digest = hashlib.sha256(supplied.encode("utf-8")).hexdigest()
+                    ok = secrets.compare_digest(digest, rec["hash"])
         except Exception:  # noqa: BLE001 — malformed header = no access
-            pass
-        self._send(401, {"error": "morph record is protected; the client authorizes itself via Mojang and sends X-Lucario-Token"})
+            ok = False
+        if ok:
+            return True
+        self._send(401, {"error": "morph record is protected"
+                                  + (" (token expired — re-authorize via Mojang)" if expired
+                                     else "; the client authorizes itself via Mojang and sends X-Lucario-Token")})
         return False
 
     # ------------------------------------------------------------- GET
@@ -1313,25 +1348,41 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def load_tokens() -> None:
+    """Loads tokens.json. Accepts BOTH formats: 1.5.7 ("hash") and the legacy
+    1.5.6-and-earlier ("token", plaintext) — legacy entries are hashed on load,
+    marked dirty and rewritten hashed on the next flush, so an upgrade keeps
+    every existing token working while the file on disk stops holding secrets."""
+    global TOK_DIRTY
     if not os.path.exists(TOK_FILE):
         return
     try:
         with open(TOK_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
+        migrated = 0
         for k, v in raw.items():
             if not isinstance(k, str) or not isinstance(v, dict):
                 continue
-            tok = v.get("token")
-            if not isinstance(tok, str) or not tok:
-                continue
+            digest = v.get("hash")
+            if isinstance(digest, str) and not re.fullmatch(r"[0-9a-f]{64}", digest):
+                digest = None
+            if digest is None:
+                # legacy plaintext entry: hash it now, drop the plaintext forever
+                legacy = v.get("token")
+                if not isinstance(legacy, str) or not legacy:
+                    continue
+                digest = hashlib.sha256(legacy.encode("utf-8")).hexdigest()
+                migrated += 1
+                TOK_DIRTY = True
             try:
                 canonical = str(uuidlib.UUID(k))
             except ValueError:
                 continue
-            TOKENS[canonical] = {"token": tok,
+            TOKENS[canonical] = {"hash": digest,
                                  "name": str(v.get("name") or ""),
                                  "ts": float(v.get("ts") or time.time())}
-        print(f"loaded {len(TOKENS)} write-tokens from {TOK_FILE}", flush=True)
+        print(f"loaded {len(TOKENS)} write-tokens from {TOK_FILE}"
+              + (f" ({migrated} migrated from plaintext, file will be rewritten hashed)" if migrated else ""),
+              flush=True)
     except Exception as e:  # noqa: BLE001 — the service must not crash on a malformed file
         print(f"cannot load {TOK_FILE}: {e!r}", flush=True)
 
@@ -1349,7 +1400,7 @@ def main() -> None:
     print(f"Lucario Morph Sync listening on 0.0.0.0:{PORT} "
           f"(variants: {len(ALLOWED)}, ttl: {ttl_desc}, housekeeping every {HOUSEKEEPING_SECONDS:g}s, "
           f"max records: {MAX_RECORDS}, flush every {FLUSH_SECONDS}s, auth via {MOJANG_SESSION}, "
-          f"write-tokens: {len(TOKENS)}; emotes: ttl {ANIM_TTL_SECONDS:g}s, sweep {ANIM_SWEEP_SECONDS:g}s, "
+          f"write-tokens: {len(TOKENS)} (ttl {TOKEN_TTL_DAYS:g}d, hashed); emotes: ttl {ANIM_TTL_SECONDS:g}s, sweep {ANIM_SWEEP_SECONDS:g}s, "
           f"ws ping {WS_PING_SECONDS:g}s, max live {MAX_WS_CLIENTS}, max per ip {MAX_WS_PER_IP}, "
           f"frame budget {WS_BURST}+1/{WS_REFILL_MS}ms kill {WS_DROP_KILL}, "
           f"assembly cap {WS_MAX_PAYLOAD}B/{WS_ASSEMBLY_DEADLINE:g}s, hello deadline {HELLO_DEADLINE:g}s, "

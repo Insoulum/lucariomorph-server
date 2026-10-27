@@ -3,7 +3,8 @@
 # Lucario Morph Sync — integration tests of the service (no Docker).
 #
 # Starts four service.py instances and a Mojang stub (mojang_stub.py):
-#   A) main:       RATE_PER_MIN=1000                      — API, authorization, tokens
+#   A) main:       RATE_PER_MIN=1000, FLUSH_SECONDS=2     — API, authorization, token
+#                  rotation (1.5.7) + migration from a seeded legacy tokens.json
 #   B) rate-limit: RATE_PER_MIN=5                         — 429 check
 #   C) storage:    MAX_RECORDS=1                          — 507 check
 #   D) ttl:        TTL_HOURS=0.003 (11 s), HOUSEKEEPING_SECONDS=2 — expiration check
@@ -60,7 +61,13 @@ STUB_PID=$!
 DATA_A="$WORK/dataA"; DATA_B="$WORK/dataB"; DATA_C="$WORK/dataC"; DATA_D="$WORK/dataD"
 mkdir -p "$DATA_A" "$DATA_B" "$DATA_C" "$DATA_D"
 
-PORT="$A_PORT" DATA_DIR="$DATA_A" RATE_PER_MIN=1000 REQUIRE_AUTH=0 \
+# Seed a LEGACY (pre-1.5.7) tokens.json with a plaintext token: the service must
+# migrate it to a hash on load and keep the old token working until TTL/rotation.
+SEED_TOKEN="seed-old-token-0123456789abcdef"
+printf '{"%s": {"token": "%s", "name": "OldPlayer", "ts": %s}}' \
+  "$U2" "$SEED_TOKEN" "$(date +%s)" > "$DATA_A/tokens.json"
+
+PORT="$A_PORT" DATA_DIR="$DATA_A" RATE_PER_MIN=1000 REQUIRE_AUTH=0 FLUSH_SECONDS=2 \
   MOJANG_SESSION="http://127.0.0.1:$STUB_PORT" \
   python3 "$ROOT/service.py" > "$WORK/a.log" 2>&1 &
 A_PID=$!
@@ -194,58 +201,75 @@ n=20
 check $n "PUT to a protected UUID with the token -> 200" $?
 n=21
 tok2=$(auth "$U3" "$NAME" "$(echo "$U3" | tr -d '-')" | jsonget "['token']")
-[ -n "$tok2" ] && [ "$tok2" = "$tok1" ]; check $n "re-authorization returns the SAME token" $?
+[ -n "$tok2" ] && [ "$tok2" != "$tok1" ]; check $n "re-authorization ROTATES: a fresh token is issued" $?
+n=22
+[ "$(code -X PUT "$A/v1/morphs/$U3" -H 'Content-Type: application/json' -H "X-Lucario-Token: $tok1" -d '{"variant": "riolu"}')" = "401" ]
+check $n "the OLD token no longer works after rotation -> 401" $?
+n=23
+[ "$(code -X PUT "$A/v1/morphs/$U3" -H 'Content-Type: application/json' -H "X-Lucario-Token: $tok2" -d '{"variant": "lucario"}')" = "200" ]
+check $n "the NEW token works after rotation -> 200" $?
+
+n=24
+[ "$(code -X PUT "$A/v1/morphs/$U2" -H 'Content-Type: application/json' -d '{"variant": "lucario"}')" = "401" ]
+check $n "a UUID seeded in the legacy tokens.json is protected -> 401 without a token" $?
+n=25
+[ "$(code -X PUT "$A/v1/morphs/$U2" -H 'Content-Type: application/json' -H "X-Lucario-Token: $SEED_TOKEN" -d '{"variant": "riolu"}')" = "200" ]
+check $n "the legacy plaintext token still works after the hash migration -> 200" $?
+n=26
+sleep 4   # FLUSH_SECONDS=2 on service A + margin
+grep -q '"hash"' "$DATA_A/tokens.json" && ! grep -q '"token"' "$DATA_A/tokens.json"
+check $n "tokens.json is rewritten hashed (no plaintext tokens left on disk)" $?
 
 # --- 4. rate limit (service B: RATE_PER_MIN=5) --------------------------------
-n=22
+n=27
 rl="429"
 for _ in 1 2 3 4 5; do code "http://127.0.0.1:$B_PORT/health" > /dev/null; done
 [ "$(code "http://127.0.0.1:$B_PORT/health")" = "429" ]; check $n "exceeding RATE_PER_MIN -> 429" $?
 
 # --- 5. storage overflow (service C: MAX_RECORDS=1) ---------------------------
-n=23
+n=28
 code -X PUT "http://127.0.0.1:$C_PORT/v1/morphs/$U1" -H 'Content-Type: application/json' -d '{"variant": "lucario"}' > /dev/null
 [ "$(code -X PUT "http://127.0.0.1:$C_PORT/v1/morphs/$U2" -H 'Content-Type: application/json' -d '{"variant": "lucario"}')" = "507" ]
 check $n "MAX_RECORDS overflow -> 507 storage full" $?
 
 # --- 6. record TTL (service D: TTL_HOURS=0.003 ≈ 11 s, HOUSEKEEPING_SECONDS=2) -
-n=24
+n=29
 code -X PUT "http://127.0.0.1:$D_PORT/v1/morphs/$U1" -H 'Content-Type: application/json' -d '{"variant": "lucariomega"}' > /dev/null
 [ "$(body "http://127.0.0.1:$D_PORT/v1/morphs?uuids=$U1" | jsonget "['$U1']")" = "lucariomega" ]
 check $n "a fresh record (TTL service) reads right after the PUT" $?
 
-n=25
+n=30
 sleep 14   # 11 s TTL + up to 2 s housekeeping + margin
 [ "$(body "http://127.0.0.1:$D_PORT/v1/morphs?uuids=$U1")" = "{}" ]
 check $n "a record older than TTL is removed by the housekeeping" $?
 
 # --- 7. emote animations over HTTP (service A; U3 is token-protected since section 3) ---
-n=26
+n=31
 [ "$(code -X PUT "$A/v1/anims/$U1" -H 'Content-Type: application/json' -d '{"anim": "dance", "state": "start", "ts": 123}')" = "200" ]
 check $n "PUT anim start -> 200" $?
-n=27
+n=32
 [ "$(body "$A/v1/anims?uuids=$U1" | jsonget "['anims']['$U1']['anim']")" = "dance" ] \
   && [ "$(body "$A/v1/anims?uuids=$U1" | jsonget "['anims']['$U1']['active']")" = "True" ]
 check $n "GET /v1/anims returns the active emote record" $?
-n=28
+n=33
 [ "$(code -X PUT "$A/v1/anims/$U1" -H 'Content-Type: application/json' -d '{"anim": "bad name!", "state": "start"}')" = "422" ]
 check $n "PUT anim with an unknown animation name -> 422" $?
-n=29
+n=34
 [ "$(code -X PUT "$A/v1/anims/$U1" -H 'Content-Type: application/json' -d '{"anim": "dance", "state": "pause"}')" = "400" ]
 check $n "PUT anim with a bad state -> 400" $?
-n=30
+n=35
 [ "$(code -X PUT "$A/v1/anims/$U3" -H 'Content-Type: application/json' -d '{"anim": "dance", "state": "start"}')" = "401" ]
 check $n "PUT anim to a protected UUID without a token -> 401" $?
-n=31
-[ "$(code -X PUT "$A/v1/anims/$U3" -H 'Content-Type: application/json' -H "X-Lucario-Token: $tok1" -d '{"anim": "dance", "state": "start"}')" = "200" ]
-check $n "PUT anim to a protected UUID with the token -> 200" $?
-n=32
+n=36
+[ "$(code -X PUT "$A/v1/anims/$U3" -H 'Content-Type: application/json' -H "X-Lucario-Token: $tok2" -d '{"anim": "dance", "state": "start"}')" = "200" ]
+check $n "PUT anim to a protected UUID with the current token -> 200" $?
+n=37
 body -X PUT "$A/v1/anims/$U1" -H 'Content-Type: application/json' -d '{"anim": "dance", "state": "stop", "ts": 456}' > /dev/null
 [ "$(body "$A/v1/anims?uuids=$U1" | jsonget "['anims']['$U1']['active']")" = "False" ]
 check $n "PUT anim stop flips the record to inactive" $?
 
 # --- 8. the emote/WS suite (its own service: push, filtering, TTL) -------------
-n=33
+n=38
 python3 "$HERE/test_ws.py" > "$WORK/ws.log" 2>&1
 check $n "emote/WS suite (see $WORK/ws.log)" $?
 
