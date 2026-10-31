@@ -1,4 +1,4 @@
-# Lucario Morph Sync — the morph sync server
+# Lucario Morph Sync-Server
 
 A tiny HTTP+WebSocket service for playing
 [Lucario Morph](https://github.com/Insoulum/lucario-morph) on servers where
